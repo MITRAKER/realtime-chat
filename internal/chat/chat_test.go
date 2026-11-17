@@ -11,6 +11,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"golang.org/x/time/rate"
 
 	"github.com/MITRAKER/realtime-chat/internal/auth"
 )
@@ -23,8 +24,12 @@ type testEnv struct {
 	handler *Handler
 	tokens  *auth.Tokens
 	nextID  int64
+	stopHub func() // like pressing Ctrl+C on the server
 }
 
+// newTestEnv starts a chat server. Its rate limit is switched off, since
+// tests send frames much faster than people do; TestFloodingClientIsSlowedDown
+// turns it back on.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	tokens, err := auth.NewTokens(testSecret, time.Hour)
@@ -34,10 +39,14 @@ func newTestEnv(t *testing.T) *testEnv {
 	done := make(chan struct{})
 	hub := NewHub()
 	go hub.Run(done)
+	var once sync.Once
+	stop := func() { once.Do(func() { close(done) }) }
+
 	h := NewHandler(hub, NewMemoryStore(500), tokens)
+	h.frameRate = rate.Inf
 	srv := httptest.NewServer(h)
-	t.Cleanup(func() { srv.Close(); close(done) })
-	return &testEnv{srv: srv, handler: h, tokens: tokens}
+	t.Cleanup(func() { srv.Close(); stop() })
+	return &testEnv{srv: srv, handler: h, tokens: tokens, stopHub: stop}
 }
 
 func (e *testEnv) token(t *testing.T, name string) string {
@@ -241,6 +250,9 @@ func TestBadFramesGetErrors(t *testing.T) {
 		{Inbound{Type: TypeAuth, Token: "x"}, "already authenticated"},
 		{Inbound{Type: TypeJoin, Room: "   "}, "room name"},
 		{Inbound{Type: TypeJoin, Room: strings.Repeat("r", 65)}, "room name"},
+		{Inbound{Type: TypeJoin, Room: "two\nlines"}, "room name"},
+		{Inbound{Type: TypeJoin, Room: "red\x1b[31m"}, "room name"}, // a terminal colour code
+		{Inbound{Type: TypeJoin, Room: "nul\x00"}, "room name"},
 	}
 	for _, c := range cases {
 		write(t, alice, c.in)
@@ -249,10 +261,68 @@ func TestBadFramesGetErrors(t *testing.T) {
 		}
 	}
 	join(t, alice, "general")
-	write(t, alice, Inbound{Type: TypeSend, Room: "general", Text: strings.Repeat("x", maxTextLength+1)})
-	if got := readUntil(t, alice, isType(TypeError)); !strings.Contains(got.Text, "too long") {
-		t.Errorf("long message: got %q", got.Text)
+	texts := map[string]string{
+		strings.Repeat("x", maxTextLength+1):   "too long",
+		strings.Repeat("é", maxTextLength/2+1): "too long", // the limit counts bytes, and é is 2
+		"hi\x00there":                          "invalid characters",
 	}
+	for text, want := range texts {
+		write(t, alice, Inbound{Type: TypeSend, Room: "general", Text: text})
+		if got := readUntil(t, alice, isType(TypeError)); !strings.Contains(got.Text, want) {
+			t.Errorf("send %.20q: got %q, want it to mention %q", text, got.Text, want)
+		}
+	}
+}
+
+func TestInvalidJSONClosesTheConnection(t *testing.T) {
+	e := newTestEnv(t)
+	for name, frame := range map[string]string{
+		"not JSON":            `{"type": "send", "te`,
+		"wrong type of value": `{"type": 42}`,
+		"not an object":       `["join", "general"]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn := e.dial(t, "alice")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := conn.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+				t.Fatal(err)
+			}
+			if code := closeCode(t, conn, 5*time.Second); code != websocket.StatusInvalidFramePayloadData {
+				t.Fatalf("close code = %v, want %v", code, websocket.StatusInvalidFramePayloadData)
+			}
+		})
+	}
+}
+
+// TestFloodingClientIsSlowedDown checks the per-connection rate limit: a
+// client that sends too fast gets an error instead of service, and other
+// people are not affected.
+func TestFloodingClientIsSlowedDown(t *testing.T) {
+	e := newTestEnv(t)
+	e.handler.frameRate = rate.Every(time.Hour) // no refills during the test
+	e.handler.frameBurst = 3
+	alice, bob := e.dial(t, "alice"), e.dial(t, "bob")
+	join(t, bob, "general")
+	join(t, alice, "general") // alice's frame 1
+	for i := 2; i <= 3; i++ {
+		write(t, alice, Inbound{Type: TypeSend, Room: "general", Text: fmt.Sprint("msg ", i)})
+		readUntil(t, alice, isType(TypeMessage))
+	}
+	write(t, alice, Inbound{Type: TypeSend, Room: "general", Text: "one too many"})
+	if got := readUntil(t, alice, isType(TypeError)); !strings.Contains(got.Text, "slow down") {
+		t.Fatalf("got %+v", got)
+	}
+
+	// Bob has his own allowance. He can still talk, and the refused
+	// message never reached him (it would have arrived before his own).
+	write(t, bob, Inbound{Type: TypeSend, Room: "general", Text: "bob is fine"})
+	readUntil(t, bob, func(o Outbound) bool {
+		if o.Text == "one too many" {
+			t.Error("a refused message was delivered")
+		}
+		return o.Type == TypeMessage && o.User == "bob"
+	})
 }
 
 func TestTooManyRooms(t *testing.T) {
@@ -322,10 +392,7 @@ func TestAuthIsRequired(t *testing.T) {
 			if first != nil {
 				write(t, conn, *first)
 			}
-			code := closeCode(t, conn, 5*time.Second)
-			// With no frame at all, the read deadline drops the connection
-			// without a close frame; either way it must not stay open.
-			if first != nil && code != StatusUnauthorized {
+			if code := closeCode(t, conn, 5*time.Second); code != StatusUnauthorized {
 				t.Fatalf("close code = %v, want %v", code, StatusUnauthorized)
 			}
 		})
@@ -400,18 +467,45 @@ func TestManyConcurrentClients(t *testing.T) {
 	}
 }
 
-// TestSlowClientIsDropped drives the hub directly, without goroutines or
-// sockets, to check the backpressure rule: a client whose buffer is full
-// gets removed, and everyone else still gets the message.
+// TestShutdownSaysGoingAway checks that stopping the server closes chat
+// connections with code 1001 ("going away"), which tells the browser it
+// may reconnect, instead of just dropping them.
+func TestShutdownSaysGoingAway(t *testing.T) {
+	e := newTestEnv(t)
+	alice := e.dial(t, "alice")
+	join(t, alice, "general")
+	e.stopHub()
+	if code := closeCode(t, alice, 5*time.Second); code != websocket.StatusGoingAway {
+		t.Fatalf("close code = %v, want %v", code, websocket.StatusGoingAway)
+	}
+}
+
+// The tests below drive the hub directly, without goroutines or sockets,
+// so they can set up exact situations that are hard to time with real
+// connections.
+
+func newTestClient(name string, buffer int) *Client {
+	return &Client{
+		user: auth.User{Username: name}, send: make(chan Outbound, buffer),
+		rooms: map[string]bool{}, joined: map[string]bool{},
+	}
+}
+
+// drain returns what is waiting in c's buffer, as "type:text" strings.
+func drain(c *Client) string {
+	var got []string
+	for len(c.send) > 0 {
+		m := <-c.send
+		got = append(got, m.Type+":"+m.Text)
+	}
+	return strings.Join(got, ",")
+}
+
+// TestSlowClientIsDropped checks the backpressure rule: a client whose
+// buffer is full gets removed, and everyone else still gets the message.
 func TestSlowClientIsDropped(t *testing.T) {
 	h := NewHub()
-	newClient := func(name string, buffer int) *Client {
-		return &Client{
-			user: auth.User{Username: name}, send: make(chan Outbound, buffer),
-			rooms: map[string]bool{}, joined: map[string]bool{},
-		}
-	}
-	fast, slow := newClient("fast", 100), newClient("slow", 1)
+	fast, slow := newTestClient("fast", 100), newTestClient("slow", 1)
 	for _, c := range []*Client{fast, slow} {
 		h.apply(command{kind: cmdRegister, client: c})
 	}
@@ -426,18 +520,62 @@ func TestSlowClientIsDropped(t *testing.T) {
 	if _, open := <-slow.send; open {
 		t.Fatal("slow client's channel should be closed")
 	}
+	if slow.goodbye != byeSlow {
+		t.Fatalf("goodbye = %+v, want %+v", slow.goodbye, byeSlow)
+	}
 	// A command still queued from the removed client must be ignored, not panic.
 	h.apply(command{kind: cmdDirect, client: slow, msg: Outbound{Type: TypeError}})
 	h.apply(command{kind: cmdJoin, client: slow, room: "r"})
 
 	h.apply(command{kind: cmdBroadcast, room: "r", msg: Outbound{Type: TypeMessage, Text: "hi"}})
-	var got []string
-	for len(fast.send) > 0 {
-		m := <-fast.send
-		got = append(got, m.Type+":"+m.Text)
-	}
-	want := "system:fast joined,system:slow left,message:hi"
-	if strings.Join(got, ",") != want {
+	if got, want := drain(fast), "system:fast joined,system:slow left,message:hi"; got != want {
 		t.Fatalf("fast got %v, want %v", got, want)
+	}
+}
+
+// TestSavedMessageIsDeliveredAfterSenderLeaves: once a message is saved
+// to the database it must reach the room, even if the sender closed the
+// tab between saving and broadcasting. Otherwise the message would show
+// up in history later but never live.
+func TestSavedMessageIsDeliveredAfterSenderLeaves(t *testing.T) {
+	h := NewHub()
+	alice, bob := newTestClient("alice", 10), newTestClient("bob", 10)
+	for _, c := range []*Client{alice, bob} {
+		h.apply(command{kind: cmdRegister, client: c})
+		h.apply(command{kind: cmdJoin, client: c, room: "r"})
+	}
+	drain(bob)
+	h.apply(command{kind: cmdUnregister, client: alice}) // alice's tab closes...
+	h.apply(command{kind: cmdBroadcast, room: "r", msg: Outbound{Type: TypeMessage, Text: "bye"}})
+	if got, want := drain(bob), "system:alice left,message:bye"; got != want {
+		t.Fatalf("bob got %v, want %v", got, want)
+	}
+}
+
+// TestSubmitNeverBlocksAfterHubStops: once the hub has stopped, nobody
+// reads its queue. submit must then say no straight away instead of
+// waiting forever, or every connection still open would hang.
+func TestSubmitNeverBlocksAfterHubStops(t *testing.T) {
+	h := NewHub()
+	done := make(chan struct{})
+	go h.Run(done)
+	close(done)
+	<-h.stopped
+
+	finished := make(chan bool)
+	go func() {
+		accepted := false
+		for range cap(h.commands) + 10 { // more than the queue holds
+			accepted = h.submit(command{kind: cmdDirect}) || accepted
+		}
+		finished <- accepted
+	}()
+	select {
+	case accepted := <-finished:
+		if accepted {
+			t.Fatal("a stopped hub accepted a command")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("submit blocked after the hub stopped")
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"golang.org/x/time/rate"
 
 	"github.com/MITRAKER/realtime-chat/internal/auth"
 )
@@ -16,6 +17,11 @@ import (
 const (
 	// defaultAuthTimeout is how long a new connection has to send its token.
 	defaultAuthTimeout = 5 * time.Second
+	// defaultFrameRate and defaultFrameBurst limit how fast one connection
+	// may send frames: on average 10 per second, with short bursts of up to
+	// 20. People don't type that fast; scripts flooding a room do.
+	defaultFrameRate  = 10
+	defaultFrameBurst = 20
 	// StatusUnauthorized is the close code for a missing, bad or expired
 	// token. Codes 4000-4999 are free for applications to use; 4401 mirrors
 	// HTTP's 401 Unauthorized so it's easy to recognise in the browser.
@@ -30,10 +36,19 @@ type Handler struct {
 	store       Store
 	tokens      *auth.Tokens
 	authTimeout time.Duration
+	frameRate   rate.Limit
+	frameBurst  int
 }
 
+// NewHandler returns the WebSocket handler for a hub, message store and
+// token checker.
 func NewHandler(hub *Hub, store Store, tokens *auth.Tokens) *Handler {
-	return &Handler{hub: hub, store: store, tokens: tokens, authTimeout: defaultAuthTimeout}
+	return &Handler{
+		hub: hub, store: store, tokens: tokens,
+		authTimeout: defaultAuthTimeout,
+		frameRate:   defaultFrameRate,
+		frameBurst:  defaultFrameBurst,
+	}
 }
 
 // ServeHTTP upgrades the request to a WebSocket, checks the login token,
@@ -79,12 +94,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	h.hub.serve(r.Context(), conn, h.store, user)
+	limiter := rate.NewLimiter(h.frameRate, h.frameBurst)
+	h.hub.serve(r.Context(), conn, h.store, user, limiter)
 }
 
+// authenticate waits for the first frame and checks its token.
 func (h *Handler) authenticate(ctx context.Context, conn *websocket.Conn) (auth.Claims, error) {
-	ctx, cancel := context.WithTimeout(ctx, h.authTimeout)
-	defer cancel()
+	// When the time is up, close the connection with our own close code.
+	// (A context deadline on the read would also stop it, but the library
+	// then drops the connection without saying why.)
+	timer := time.AfterFunc(h.authTimeout, func() {
+		conn.Close(StatusUnauthorized, "no login token received")
+	})
+	defer timer.Stop()
+
 	var in Inbound
 	if err := wsjson.Read(ctx, conn, &in); err != nil {
 		return auth.Claims{}, err

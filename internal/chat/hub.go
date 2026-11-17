@@ -1,9 +1,10 @@
 package chat
 
 import (
-	"context"
 	"log/slog"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // Hub is the heart of the server. It knows which clients are in which room
@@ -21,6 +22,7 @@ import (
 // query can't hold up every room.
 type Hub struct {
 	commands chan command
+	stopped  chan struct{} // closed when Run returns
 	rooms    map[string]map[*Client]bool
 	clients  map[*Client]bool
 	now      func() time.Time
@@ -51,35 +53,72 @@ type command struct {
 func NewHub() *Hub {
 	return &Hub{
 		commands: make(chan command, 1024),
+		stopped:  make(chan struct{}),
 		rooms:    make(map[string]map[*Client]bool),
 		clients:  make(map[*Client]bool),
 		now:      time.Now,
 	}
 }
 
+// closeReason is the WebSocket close code and text a removed client's
+// connection is closed with, so the browser knows why it was dropped.
+type closeReason struct {
+	code websocket.StatusCode
+	text string
+}
+
+var (
+	byeNormal   = closeReason{websocket.StatusNormalClosure, ""}
+	byeSlow     = closeReason{websocket.StatusPolicyViolation, "too slow to keep up"}
+	byeShutdown = closeReason{websocket.StatusGoingAway, "server shutting down"}
+)
+
 // Run is the hub's event loop. Start it once with `go hub.Run(done)`.
-// It disconnects everyone and returns when done is closed.
+// When done is closed it disconnects everyone and returns.
 func (h *Hub) Run(done <-chan struct{}) {
+	defer close(h.stopped)
 	for {
 		select {
 		case cmd := <-h.commands:
 			h.apply(cmd)
 		case <-done:
-			for c := range h.clients {
-				h.removeClient(c)
-			}
+			h.shutdown()
 			return
 		}
 	}
 }
 
-// submit hands a command to the hub. It returns false if ctx ends first
-// (for example, the server is shutting down and the hub has stopped).
-func (h *Hub) submit(ctx context.Context, cmd command) bool {
+// shutdown says goodbye to every client. It doesn't announce "X left" in
+// each room: everyone is leaving at once, and with n people in a room
+// that would be n*n messages nobody reads.
+func (h *Hub) shutdown() {
+	for c := range h.clients {
+		c.goodbye = byeShutdown
+		close(c.send)
+	}
+	clear(h.clients)
+	clear(h.rooms)
+}
+
+// submit hands a command to the hub. It waits while the hub's queue is
+// full, and returns false if the hub has stopped (server shutdown).
+//
+// It deliberately doesn't watch the connection's context: a message that
+// was already saved must still be broadcast, and an unregister must still
+// happen, even if the sender's connection has just died.
+func (h *Hub) submit(cmd command) bool {
+	// When both cases of a select are ready, Go picks one at random. Check
+	// "stopped" on its own first, so a stopped hub reliably says no instead
+	// of queueing commands that nobody will ever read.
+	select {
+	case <-h.stopped:
+		return false
+	default:
+	}
 	select {
 	case h.commands <- cmd:
 		return true
-	case <-ctx.Done():
+	case <-h.stopped:
 		return false
 	}
 }
@@ -104,7 +143,7 @@ func (h *Hub) apply(cmd command) {
 	}
 	switch cmd.kind {
 	case cmdUnregister:
-		h.removeClient(c)
+		h.removeClient(c, byeNormal)
 	case cmdJoin:
 		h.join(c, cmd.room)
 	case cmdLeave:
@@ -162,10 +201,10 @@ func (h *Hub) broadcast(room string, msg Outbound) {
 
 func (h *Hub) dropSlow(c *Client) {
 	slog.Warn("dropping slow client", "user", c.user.Username)
-	h.removeClient(c)
+	h.removeClient(c, byeSlow)
 }
 
-func (h *Hub) removeClient(c *Client) {
+func (h *Hub) removeClient(c *Client, why closeReason) {
 	if !h.clients[c] {
 		return
 	}
@@ -173,5 +212,9 @@ func (h *Hub) removeClient(c *Client) {
 	for room := range c.rooms {
 		h.leave(c, room)
 	}
-	close(c.send) // tells the client's writer goroutine to shut down
+	// Closing send tells the client's writeLoop to close the connection
+	// with this reason. Setting goodbye first is safe without a lock:
+	// closing a channel "happens before" the receive that sees it closed.
+	c.goodbye = why
+	close(c.send)
 }

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -99,6 +100,13 @@ func writeAuthError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrInvalidCredentials):
 		writeError(w, http.StatusUnauthorized, err.Error())
+	case errors.Is(err, ErrBusy):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, context.Canceled):
+		// The browser went away before we finished. That's not a bug, so
+		// don't log it, but still answer: an empty reply would be a 200.
+		writeError(w, http.StatusServiceUnavailable, "request cancelled")
 	default:
 		slog.Error("auth request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")

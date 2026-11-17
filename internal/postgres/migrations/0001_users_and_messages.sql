@@ -6,8 +6,8 @@ CREATE TABLE users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- "Alice" and "alice" count as the same name, so nobody can register a
--- look-alike of someone else's account. The index also makes login fast.
+-- "Alice" and "alice" count as the same name, so nobody can register
+-- ALICE while alice exists. The index also makes login fast.
 CREATE UNIQUE INDEX users_username_lower_key ON users (lower(username));
 
 -- Chat messages. The id doubles as the message order: identity values only

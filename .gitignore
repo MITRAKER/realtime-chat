@@ -1,0 +1,17 @@
+# Local configuration with secrets
+.env
+
+# Build output
+/server
+/bin/
+/dist/
+
+# Test and coverage output
+*.out
+*.test
+coverage.*
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store

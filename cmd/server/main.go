@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -86,20 +85,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The hub stops as soon as we're told to shut down, and closes every
+	// chat connection with "going away" (1001) so browsers can reconnect.
+	// srv.Shutdown below can't do that part: it only waits for ordinary
+	// HTTP requests, and WebSockets have left the HTTP server's hands.
 	hub := chat.NewHub()
 	go hub.Run(ctx.Done())
 
-	srv := &http.Server{
-		Addr: addr,
-		Handler: app.Routes(app.Deps{
-			Auth: authService, Tokens: tokens, Hub: hub,
-			Messages: messages, Static: web.Files, Ready: ready,
-		}),
-		ReadHeaderTimeout: 5 * time.Second,
-		// Every request's context is derived from ctx, so Ctrl+C also
-		// cancels open WebSocket connections.
-		BaseContext: func(net.Listener) context.Context { return ctx },
-	}
+	routes := app.Routes(app.Deps{
+		Auth: authService, Tokens: tokens, Hub: hub,
+		Messages: messages, Static: web.Files, Ready: ready,
+	})
+	srv := app.NewHTTPServer(addr, routes, app.DefaultTimeouts())
 
 	errc := make(chan error, 1)
 	go func() {
@@ -114,6 +111,8 @@ func run() error {
 		}
 	case <-ctx.Done():
 		slog.Info("shutting down")
+		// Stop accepting connections and let requests already running
+		// (a login, say) finish, for up to 10 seconds.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

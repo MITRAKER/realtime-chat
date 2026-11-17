@@ -78,12 +78,18 @@ function notice(text, cls = 'system') {
 $('account').onsubmit = async e => {
   e.preventDefault();
   const action = e.submitter.dataset.action;
-  const res = await fetch(`/api/${action}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: $('username').value, password: $('password').value }),
-  });
-  const body = await res.json();
+  let res, body;
+  try {
+    res = await fetch(`/api/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('username').value, password: $('password').value }),
+    });
+    body = await res.json();
+  } catch {
+    notice('Error: could not reach the server', 'error');
+    return;
+  }
   if (!res.ok) { notice('Error: ' + body.error, 'error'); return; }
   token = body.token;
   $('whoami').textContent = `Logged in as ${body.user.username}`;
@@ -92,18 +98,25 @@ $('account').onsubmit = async e => {
 
 $('connect').onsubmit = e => {
   e.preventDefault();
-  if (ws) ws.close();
+  if (ws) {
+    // Silence the old socket before closing it. Its close event arrives
+    // later, after the new socket exists, and would otherwise hide the
+    // send box and print "Disconnected" for the new connection.
+    ws.onmessage = ws.onclose = null;
+    ws.close();
+  }
   room = $('room').value.trim();
   messages.clear(); notices = []; hasOlder = false;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const sock = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = sock;
   // First frame proves who we are. Browsers can't set an Authorization
   // header on a WebSocket, so the token goes in a message instead.
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', token }));
-  ws.onmessage = e => {
+  sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', token }));
+  sock.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.type === 'ready') {
-      ws.send(JSON.stringify({ type: 'join', room }));
+      sock.send(JSON.stringify({ type: 'join', room }));
       $('send').classList.remove('hidden');
     } else if (m.type === 'message') {
       messages.set(m.id, m); render();
@@ -120,9 +133,14 @@ $('connect').onsubmit = e => {
       notice('Error: ' + m.text, 'error');
     }
   };
-  ws.onclose = e => {
+  sock.onclose = e => {
     $('send').classList.add('hidden');
-    notice(e.code === 4401 ? 'Your login expired. Please log in again.' : 'Disconnected', 'error');
+    const why = {
+      4401: 'Your login expired. Please log in again.',
+      1001: 'The server is restarting. Join the room again in a moment.',
+      1008: 'Disconnected: ' + (e.reason || 'refused by the server'),
+    };
+    notice(why[e.code] || 'Disconnected', 'error');
   };
 };
 

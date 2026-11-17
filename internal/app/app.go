@@ -4,6 +4,7 @@ package app
 import (
 	"io/fs"
 	"net/http"
+	"time"
 
 	"github.com/MITRAKER/realtime-chat/internal/auth"
 	"github.com/MITRAKER/realtime-chat/internal/chat"
@@ -47,4 +48,40 @@ func Routes(d Deps) http.Handler {
 	})
 	mux.Handle("GET /", http.FileServerFS(d.Static))
 	return mux
+}
+
+// Timeouts protect the server from clients that connect and then go quiet
+// or trickle bytes slowly, each holding a connection (and its memory)
+// forever. That attack is called Slowloris.
+type Timeouts struct {
+	ReadHeader time.Duration // to receive the request headers
+	Read       time.Duration // to receive the whole request, body included
+	Write      time.Duration // to send the whole response
+	Idle       time.Duration // a kept-alive connection may sit unused
+}
+
+// DefaultTimeouts are generous for real browsers and short for attackers.
+func DefaultTimeouts() Timeouts {
+	return Timeouts{
+		ReadHeader: 5 * time.Second,
+		Read:       15 * time.Second,
+		Write:      15 * time.Second,
+		Idle:       60 * time.Second,
+	}
+}
+
+// NewHTTPServer configures the HTTP server. These timeouts don't cut
+// WebSockets short: when a request is upgraded, Go's HTTP server hands
+// the connection over and clears its deadlines, and the chat code manages
+// its own (pings, write timeouts). TestServerTimeoutsDoNotCutWebSockets
+// checks this.
+func NewHTTPServer(addr string, h http.Handler, t Timeouts) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: t.ReadHeader,
+		ReadTimeout:       t.Read,
+		WriteTimeout:      t.Write,
+		IdleTimeout:       t.Idle,
+	}
 }

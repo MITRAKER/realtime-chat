@@ -23,8 +23,9 @@ import (
 
 var secret = []byte("test-secret-that-is-at-least-32-bytes-long")
 
-// startServer runs the whole app, like main() does, on top of the given stores.
-func startServer(t *testing.T, users auth.UserStore, messages chat.Store) *httptest.Server {
+// newRoutes builds the whole app, like main() does, on top of the given
+// stores. The hub stops when the test ends.
+func newRoutes(t *testing.T, users auth.UserStore, messages chat.Store) http.Handler {
 	t.Helper()
 	tokens, err := auth.NewTokens(secret, time.Hour)
 	if err != nil {
@@ -37,11 +38,19 @@ func startServer(t *testing.T, users auth.UserStore, messages chat.Store) *httpt
 	done := make(chan struct{})
 	hub := chat.NewHub()
 	go hub.Run(done)
-	srv := httptest.NewServer(app.Routes(app.Deps{
+	t.Cleanup(func() { close(done) })
+	return app.Routes(app.Deps{
 		Auth: svc, Tokens: tokens, Hub: hub, Messages: messages,
 		Static: fstest.MapFS{"index.html": {Data: []byte("test page")}},
-	}))
-	t.Cleanup(func() { srv.Close(); close(done) })
+	})
+}
+
+// startServer runs the app on a local port. Cleanups run last-in,
+// first-out, so the server stops before the hub does.
+func startServer(t *testing.T, users auth.UserStore, messages chat.Store) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(newRoutes(t, users, messages))
+	t.Cleanup(srv.Close)
 	return srv
 }
 
