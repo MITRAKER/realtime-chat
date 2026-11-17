@@ -3,68 +3,158 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Realtime Chat (step 1 test page)</title>
+<title>Realtime Chat (test page)</title>
 <style>
   body { font: 15px system-ui, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
   #log { border: 1px solid #ccc; height: 360px; overflow-y: auto; padding: 8px; margin: 12px 0; }
   .system { color: #777; font-style: italic; }
   .error { color: #b00; }
+  .hidden { display: none; }
   input, button { font: inherit; padding: 6px; }
-  form { display: flex; gap: 8px; }
-  form input { flex: 1; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  form input { flex: 1; min-width: 120px; }
 </style>
 </head>
 <body>
 <h1>Realtime Chat</h1>
-<p>Step 1 test page. Open it in two tabs with different names to see messages arrive live.</p>
-<form id="connect">
-  <input id="name" placeholder="your name" required pattern="[A-Za-z0-9_-]{1,32}">
+<p>Test page for the server. Open it in two tabs, sign up as two different people, join the same room and chat.</p>
+
+<form id="account">
+  <input id="username" placeholder="username" autocomplete="username" required>
+  <input id="password" type="password" placeholder="password (8+ characters)" autocomplete="current-password" required>
+  <button data-action="login">Log in</button>
+  <button data-action="register">Sign up</button>
+</form>
+<p id="whoami" class="system"></p>
+
+<form id="connect" class="hidden">
   <input id="room" placeholder="room" value="general" required>
-  <button>Connect</button>
+  <button>Join room</button>
 </form>
+<button id="older" class="hidden">Load older messages</button>
 <div id="log"></div>
-<form id="send">
-  <input id="text" placeholder="message" autocomplete="off" disabled>
-  <button disabled>Send</button>
+<form id="send" class="hidden">
+  <input id="text" placeholder="message" autocomplete="off">
+  <button>Send</button>
 </form>
+
 <script>
-let ws, room;
-const log = document.getElementById('log');
-function show(text, cls) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  if (cls) div.className = cls;
-  log.append(div);
+// The token lives only in this variable, so it's gone when you reload.
+// (Step 3 discusses where a real frontend should keep it.)
+let token = null, ws = null, room = null;
+const messages = new Map(); // id -> message, so duplicates are ignored
+let notices = [];           // join/leave/errors, which have no id
+let hasOlder = false;
+
+const $ = id => document.getElementById(id);
+
+function render() {
+  const log = $('log');
+  log.replaceChildren();
+  // Messages can arrive out of order (two people sending at once), so
+  // always show them sorted by id, the server's order.
+  const sorted = [...messages.values()].sort((a, b) => a.id - b.id);
+  for (const m of sorted) {
+    const div = document.createElement('div');
+    div.textContent = `[${new Date(m.time).toLocaleTimeString()}] ${m.user}: ${m.text}`;
+    log.append(div);
+  }
+  for (const n of notices) {
+    const div = document.createElement('div');
+    div.textContent = n.text;
+    div.className = n.cls;
+    log.append(div);
+  }
   log.scrollTop = log.scrollHeight;
+  $('older').classList.toggle('hidden', !hasOlder);
 }
-function render(m) {
-  const t = m.time ? new Date(m.time).toLocaleTimeString() : '';
-  if (m.type === 'message') show(`[${t}] ${m.user}: ${m.text}`);
-  else if (m.type === 'system') show(m.text, 'system');
-  else if (m.type === 'error') show('Error: ' + m.text, 'error');
-  else if (m.type === 'history') m.messages.forEach(render);
+
+function notice(text, cls = 'system') {
+  notices.push({ text, cls });
+  notices = notices.slice(-5);
+  render();
 }
-document.getElementById('connect').onsubmit = e => {
+
+$('account').onsubmit = async e => {
   e.preventDefault();
-  if (ws) ws.close();
-  room = document.getElementById('room').value;
-  const name = encodeURIComponent(document.getElementById('name').value);
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?name=${name}`);
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'join', room }));
-    document.querySelectorAll('#send input, #send button').forEach(el => el.disabled = false);
-    show(`Connected to #${room}`, 'system');
-  };
-  ws.onmessage = e => render(JSON.parse(e.data));
-  ws.onclose = () => show('Disconnected', 'error');
+  const action = e.submitter.dataset.action;
+  let res, body;
+  try {
+    res = await fetch(`/api/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('username').value, password: $('password').value }),
+    });
+    body = await res.json();
+  } catch {
+    notice('Error: could not reach the server', 'error');
+    return;
+  }
+  if (!res.ok) { notice('Error: ' + body.error, 'error'); return; }
+  token = body.token;
+  $('whoami').textContent = `Logged in as ${body.user.username}`;
+  $('connect').classList.remove('hidden');
 };
-document.getElementById('send').onsubmit = e => {
+
+$('connect').onsubmit = e => {
   e.preventDefault();
-  const input = document.getElementById('text');
-  if (!input.value.trim()) return;
-  ws.send(JSON.stringify({ type: 'send', room, text: input.value }));
-  input.value = '';
+  if (ws) {
+    // Silence the old socket before closing it. Its close event arrives
+    // later, after the new socket exists, and would otherwise hide the
+    // send box and print "Disconnected" for the new connection.
+    ws.onmessage = ws.onclose = null;
+    ws.close();
+  }
+  room = $('room').value.trim();
+  messages.clear(); notices = []; hasOlder = false;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = sock;
+  // First frame proves who we are. Browsers can't set an Authorization
+  // header on a WebSocket, so the token goes in a message instead.
+  sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', token }));
+  sock.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'ready') {
+      sock.send(JSON.stringify({ type: 'join', room }));
+      $('send').classList.remove('hidden');
+    } else if (m.type === 'message') {
+      messages.set(m.id, m); render();
+    } else if (m.type === 'history') {
+      (m.messages || []).forEach(x => messages.set(x.id, x));
+      // "more" describes the page we just got. Only the oldest page we
+      // have tells us whether anything older exists.
+      const oldest = Math.min(...messages.keys());
+      if (!m.messages?.length || m.messages[0].id <= oldest) hasOlder = !!m.more;
+      render();
+    } else if (m.type === 'system') {
+      notice(m.text);
+    } else if (m.type === 'error') {
+      notice('Error: ' + m.text, 'error');
+    }
+  };
+  sock.onclose = e => {
+    $('send').classList.add('hidden');
+    const why = {
+      4401: 'Your login expired. Please log in again.',
+      1001: 'The server is restarting. Join the room again in a moment.',
+      1008: 'Disconnected: ' + (e.reason || 'refused by the server'),
+    };
+    notice(why[e.code] || 'Disconnected', 'error');
+  };
+};
+
+$('older').onclick = () => {
+  const oldest = Math.min(...messages.keys());
+  ws.send(JSON.stringify({ type: 'history', room, before: oldest }));
+};
+
+$('send').onsubmit = e => {
+  e.preventDefault();
+  const text = $('text').value;
+  if (!text.trim() || !ws) return;
+  ws.send(JSON.stringify({ type: 'send', room, text }));
+  $('text').value = '';
 };
 </script>
 </body>

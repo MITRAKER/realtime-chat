@@ -1,0 +1,26 @@
+# Local services for development. Start them with:
+#   docker compose up -d
+# The database data lives in a named volume, so it survives restarts.
+# Remove everything (including data) with: docker compose down -v
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: chat
+      POSTGRES_DB: chat
+    ports:
+      # Only reachable from this computer, not from the rest of the network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Creates an extra, empty chat_test database for `go test`.
+      - ./scripts/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat -d chat"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  db-data:
