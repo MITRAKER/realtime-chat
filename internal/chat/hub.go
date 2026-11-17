@@ -1,63 +1,69 @@
 package chat
 
 import (
+	"context"
 	"log/slog"
-	"strings"
 	"time"
 )
 
+// Hub is the heart of the server. It knows which clients are in which room
+// and delivers messages to them.
+//
+// Only the hub's own goroutine (Run) ever reads or writes its maps.
+// Everyone else asks it to do things by sending a command on one channel.
+// This is Go's motto in action: "Don't communicate by sharing memory;
+// share memory by communicating." Because one goroutine owns the maps,
+// they need no locks and can't have data races.
+//
+// The hub never waits for anything slow: no database, no network. Saving
+// to the database happens in each client's own goroutine (see client.go),
+// and the hub only fans already-saved messages out from memory. One slow
+// query can't hold up every room.
+type Hub struct {
+	commands chan command
+	rooms    map[string]map[*Client]bool
+	clients  map[*Client]bool
+	now      func() time.Time
+}
+
+type commandKind int
+
 const (
-	maxRoomName   = 64
-	maxTextLength = 2000
-	historySize   = 50
+	cmdRegister   commandKind = iota // a client connected
+	cmdUnregister                    // a client disconnected
+	cmdJoin                          // client joins room
+	cmdLeave                         // client leaves room
+	cmdBroadcast                     // send msg to everyone in room (client is unused)
+	cmdDirect                        // send msg to one client
 )
 
-// Hub is the heart of the server. It owns the map of rooms -> clients.
-//
-// Only the hub's own goroutine (Run) ever reads or writes that map.
-// Everyone else talks to the hub by sending a request on a channel.
-// This is Go's motto in action: "Don't communicate by sharing memory;
-// share memory by communicating." Because one goroutine owns the map,
-// we need no locks around it and can't have data races on it.
-type Hub struct {
-	store      Store
-	register   chan *Client
-	unregister chan *Client
-	inbound    chan clientMsg
-	rooms      map[string]map[*Client]bool
-	clients    map[*Client]bool
-	now        func() time.Time
+// command is one request to the hub. Every kind goes through the same
+// channel on purpose: a channel is first-in, first-out, so if a client
+// sends "join" and then "send", the hub is guaranteed to process them in
+// that order. Separate channels would not guarantee that.
+type command struct {
+	kind   commandKind
+	client *Client
+	room   string
+	msg    Outbound
 }
 
-// clientMsg pairs a message with the client that sent it.
-type clientMsg struct {
-	from *Client
-	msg  Inbound
-}
-
-func NewHub(store Store) *Hub {
+func NewHub() *Hub {
 	return &Hub{
-		store:      store,
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		inbound:    make(chan clientMsg, 256),
-		rooms:      make(map[string]map[*Client]bool),
-		clients:    make(map[*Client]bool),
-		now:        time.Now,
+		commands: make(chan command, 1024),
+		rooms:    make(map[string]map[*Client]bool),
+		clients:  make(map[*Client]bool),
+		now:      time.Now,
 	}
 }
 
 // Run is the hub's event loop. Start it once with `go hub.Run(done)`.
-// It returns when done is closed.
+// It disconnects everyone and returns when done is closed.
 func (h *Hub) Run(done <-chan struct{}) {
 	for {
 		select {
-		case c := <-h.register:
-			h.clients[c] = true
-		case c := <-h.unregister:
-			h.removeClient(c)
-		case cm := <-h.inbound:
-			h.handle(cm.from, cm.msg)
+		case cmd := <-h.commands:
+			h.apply(cmd)
 		case <-done:
 			for c := range h.clients {
 				h.removeClient(c)
@@ -67,24 +73,46 @@ func (h *Hub) Run(done <-chan struct{}) {
 	}
 }
 
-func (h *Hub) handle(c *Client, in Inbound) {
-	if !h.clients[c] {
-		return // client was already removed; its send channel is closed
+// submit hands a command to the hub. It returns false if ctx ends first
+// (for example, the server is shutting down and the hub has stopped).
+func (h *Hub) submit(ctx context.Context, cmd command) bool {
+	select {
+	case h.commands <- cmd:
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	room := strings.TrimSpace(in.Room)
-	if room == "" || len(room) > maxRoomName {
-		c.trySend(Outbound{Type: TypeError, Text: "room name must be 1-64 characters"})
+}
+
+func (h *Hub) apply(cmd command) {
+	c := cmd.client
+	switch cmd.kind {
+	case cmdRegister:
+		h.clients[c] = true
+		return
+	case cmdBroadcast:
+		// The message is already saved, so deliver it even if its sender
+		// has disconnected in the meantime.
+		h.broadcast(cmd.room, cmd.msg)
 		return
 	}
-	switch in.Type {
-	case TypeJoin:
-		h.join(c, room)
-	case TypeLeave:
-		h.leave(c, room)
-	case TypeSend:
-		h.send(c, room, in.Text)
-	default:
-		c.trySend(Outbound{Type: TypeError, Text: "unknown message type: " + in.Type})
+	if !h.clients[c] {
+		// The client was already removed (for example it was too slow) and
+		// its send channel is closed. A command from it can still be queued,
+		// so ignore it: sending on a closed channel would crash the server.
+		return
+	}
+	switch cmd.kind {
+	case cmdUnregister:
+		h.removeClient(c)
+	case cmdJoin:
+		h.join(c, cmd.room)
+	case cmdLeave:
+		h.leave(c, cmd.room)
+	case cmdDirect:
+		if !c.trySend(cmd.msg) {
+			h.dropSlow(c)
+		}
 	}
 }
 
@@ -99,14 +127,7 @@ func (h *Hub) join(c *Client, room string) {
 	}
 	members[c] = true
 	c.rooms[room] = true
-
-	// Send the newcomer what they missed, then tell everyone they arrived.
-	history, err := h.store.Recent(room, historySize)
-	if err != nil {
-		slog.Error("load history", "room", room, "err", err)
-	}
-	c.trySend(Outbound{Type: TypeHistory, Room: room, Messages: history})
-	h.broadcast(room, Outbound{Type: TypeSystem, Room: room, User: c.name, Text: c.name + " joined", Time: h.now()})
+	h.broadcast(room, Outbound{Type: TypeSystem, Room: room, UserID: c.user.ID, User: c.user.Username, Text: c.user.Username + " joined", Time: h.now().UTC()})
 }
 
 func (h *Hub) leave(c *Client, room string) {
@@ -119,41 +140,29 @@ func (h *Hub) leave(c *Client, room string) {
 	if len(members) == 0 {
 		delete(h.rooms, room) // don't keep empty rooms around forever
 	}
-	h.broadcast(room, Outbound{Type: TypeSystem, Room: room, User: c.name, Text: c.name + " left", Time: h.now()})
-}
-
-func (h *Hub) send(c *Client, room, text string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return
-	}
-	if len(text) > maxTextLength {
-		c.trySend(Outbound{Type: TypeError, Text: "message too long"})
-		return
-	}
-	if !h.rooms[room][c] {
-		c.trySend(Outbound{Type: TypeError, Room: room, Text: "join the room before sending"})
-		return
-	}
-	msg, err := h.store.Save(room, c.name, text, h.now())
-	if err != nil {
-		slog.Error("save message", "room", room, "err", err)
-		c.trySend(Outbound{Type: TypeError, Room: room, Text: "could not save message"})
-		return
-	}
-	h.broadcast(room, msg)
+	h.broadcast(room, Outbound{Type: TypeSystem, Room: room, UserID: c.user.ID, User: c.user.Username, Text: c.user.Username + " left", Time: h.now().UTC()})
 }
 
 // broadcast fans a message out to every client in the room.
 // It never blocks: a client whose send buffer is full is too slow,
 // so we disconnect it instead of letting it stall the whole hub.
 func (h *Hub) broadcast(room string, msg Outbound) {
+	var slow []*Client
 	for c := range h.rooms[room] {
 		if !c.trySend(msg) {
-			slog.Warn("dropping slow client", "user", c.name)
-			h.removeClient(c)
+			slow = append(slow, c)
 		}
 	}
+	// Remove slow clients after the loop: removing one makes it "leave"
+	// its rooms, which changes the map we were looping over.
+	for _, c := range slow {
+		h.dropSlow(c)
+	}
+}
+
+func (h *Hub) dropSlow(c *Client) {
+	slog.Warn("dropping slow client", "user", c.user.Username)
+	h.removeClient(c)
 }
 
 func (h *Hub) removeClient(c *Client) {
