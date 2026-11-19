@@ -1,0 +1,20 @@
+name: Dependency review
+
+# On every pull request, check whether it adds or upgrades a dependency
+# with a known vulnerability or an incompatible license, and fail if so.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # to post a summary comment
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
