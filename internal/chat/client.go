@@ -2,10 +2,11 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -20,9 +21,9 @@ const (
 	pingInterval    = 30 * time.Second // how often we check the connection is alive
 	storeTimeout    = 5 * time.Second  // give up on a database call after this long
 	maxFrameSize    = 8 << 10          // 8 KB: bigger frames are rejected
-	maxRoomName     = 64
-	maxTextLength   = 2000
-	maxRoomsPerConn = 100 // stops one connection from joining millions of rooms
+	maxRoomName     = 64               // bytes
+	maxTextLength   = 2000             // bytes, not characters: "é" is 2 bytes
+	maxRoomsPerConn = 100              // stops one connection from joining millions of rooms
 	historyPageSize = 50
 )
 
@@ -72,6 +73,9 @@ func (h *Hub) serve(ctx context.Context, conn *websocket.Conn, store Store, user
 		rooms: map[string]bool{}, joined: map[string]bool{},
 	}
 	if !h.submit(command{kind: cmdRegister, client: c}) {
+		// The hub has stopped, so the server is shutting down. Say so, as
+		// the hub does to everyone it was serving.
+		_ = conn.Close(byeShutdown.code, byeShutdown.text)
 		return
 	}
 
@@ -81,12 +85,16 @@ func (h *Hub) serve(ctx context.Context, conn *websocket.Conn, store Store, user
 	go c.writeLoop(connCtx, cancel)
 	c.readLoop(connCtx)
 
-	// Reading stopped (the browser left or errored). Ask the hub to clean up.
-	h.submit(command{kind: cmdUnregister, client: c})
-	conn.Close(websocket.StatusNormalClosure, "")
+	// Reading stopped (the browser left or errored). Ask the hub to clean
+	// up. If the hub has already stopped, there's nothing left to clean.
+	_ = h.submit(command{kind: cmdUnregister, client: c})
+	// The error only says the connection was already closed: nothing to do.
+	_ = conn.Close(websocket.StatusNormalClosure, "")
 }
 
 func (c *Client) readLoop(ctx context.Context) {
+	// jpl:loop one frame per pass; returns when the connection ends or
+	// handle says to stop.
 	for {
 		var in Inbound
 		// A frame that isn't a JSON object of the right shape ends the
@@ -113,77 +121,89 @@ func (c *Client) handle(ctx context.Context, in Inbound) bool {
 	// sends faster than the limit gets an error instead of service, so one
 	// script can't flood a room (or the database) for everyone else.
 	if !c.limiter.Allow() {
-		return c.reply(Outbound{Type: TypeError, Text: "too many messages, slow down"})
-	}
-	switch in.Type {
-	case TypeJoin, TypeLeave, TypeHistory, TypeSend:
-	case TypeAuth:
-		return c.reply(Outbound{Type: TypeError, Text: "already authenticated"})
-	default:
-		return c.reply(Outbound{Type: TypeError, Text: "unknown message type"})
+		return c.replyError("", "too many messages, slow down")
 	}
 	room := strings.TrimSpace(in.Room)
-	if !validRoomName(room) {
-		return c.reply(Outbound{Type: TypeError, Text: "room name must be 1-64 bytes with no control characters"})
+	switch in.Type {
+	case TypeAuth:
+		return c.replyError("", "already authenticated")
+	case TypeJoin, TypeLeave, TypeHistory, TypeSend:
+		if !validRoomName(room) {
+			return c.replyError("", "room name must be 1-64 characters: letters, digits, _ or -")
+		}
+	default:
+		return c.replyError("", "unknown message type")
 	}
 	switch in.Type {
 	case TypeJoin:
-		if c.joined[room] {
-			return true
-		}
-		if len(c.joined) >= maxRoomsPerConn {
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "too many rooms joined"})
-		}
-		c.joined[room] = true
-		// Subscribe FIRST, then load history. A message sent while the
-		// history query runs then reaches us live (and maybe also in the
-		// history page; the browser drops duplicates by id). Doing it the
-		// other way round would leave a gap where messages are lost.
-		if !c.hub.submit(command{kind: cmdJoin, client: c, room: room}) {
-			return false
-		}
-		return c.sendHistory(ctx, room, 0)
-
+		return c.join(ctx, room)
 	case TypeLeave:
-		if !c.joined[room] {
-			return true
-		}
-		delete(c.joined, room)
-		return c.hub.submit(command{kind: cmdLeave, client: c, room: room})
-
+		return c.leave(room)
 	case TypeHistory:
-		if !c.joined[room] {
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "join the room first"})
-		}
-		return c.sendHistory(ctx, room, in.Before)
-
-	case TypeSend:
-		text := strings.TrimSpace(in.Text)
-		switch {
-		case text == "":
-			return true
-		case len(text) > maxTextLength:
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "message too long"})
-		case strings.ContainsRune(text, 0):
-			// PostgreSQL can't store the NUL character in text, and no
-			// human types one, so refuse it before it reaches the database.
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "message contains invalid characters"})
-		case !c.joined[room]:
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "join the room before sending"})
-		}
-		sctx, cancel := context.WithTimeout(ctx, storeTimeout)
-		msg, err := c.store.SaveMessage(sctx, room, c.user, text)
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return false // shutting down
-			}
-			slog.Error("save message", "room", room, "err", err)
-			return c.reply(Outbound{Type: TypeError, Room: room, Text: "could not save message, try again"})
-		}
-		return c.hub.submit(command{kind: cmdBroadcast, room: room, msg: msg})
+		return c.history(ctx, room, in.Before)
+	default: // TypeSend, the only type left
+		return c.post(ctx, room, in.Text)
 	}
-	return true
+}
+
+// join subscribes the client to a room and sends it the latest messages.
+func (c *Client) join(ctx context.Context, room string) bool {
+	if c.joined[room] {
+		return true
+	}
+	if len(c.joined) >= maxRoomsPerConn {
+		return c.replyError(room, "too many rooms joined")
+	}
+	c.joined[room] = true
+	// Subscribe FIRST, then load history. A message sent while the
+	// history query runs then reaches us live (and maybe also in the
+	// history page; the browser drops duplicates by id). Doing it the
+	// other way round would leave a gap where messages are lost.
+	if !c.hub.submit(command{kind: cmdJoin, client: c, room: room}) {
+		return false
+	}
+	return c.sendHistory(ctx, room, 0)
+}
+
+func (c *Client) leave(room string) bool {
+	if !c.joined[room] {
+		return true
+	}
+	delete(c.joined, room)
+	return c.hub.submit(command{kind: cmdLeave, client: c, room: room})
+}
+
+// history sends one page of messages older than the id "before".
+func (c *Client) history(ctx context.Context, room string, before int64) bool {
+	if !c.joined[room] {
+		return c.replyError(room, "join the room first")
+	}
+	return c.sendHistory(ctx, room, before)
+}
+
+// post saves a chat message and asks the hub to deliver it.
+func (c *Client) post(ctx context.Context, room, text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return true
+	}
+	if problem := textProblem(text); problem != "" {
+		return c.replyError(room, problem)
+	}
+	if !c.joined[room] {
+		return c.replyError(room, "join the room before sending")
+	}
+	sctx, cancel := context.WithTimeout(ctx, storeTimeout)
+	msg, err := c.store.SaveMessage(sctx, room, c.user, text)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return false // the connection is closing
+		}
+		slog.Error("save message", "room", room, "err", err)
+		return c.replyError(room, "could not save message, try again")
+	}
+	return c.hub.submit(command{kind: cmdBroadcast, room: room, msg: msg})
 }
 
 func (c *Client) sendHistory(ctx context.Context, room string, before int64) bool {
@@ -195,19 +215,46 @@ func (c *Client) sendHistory(ctx context.Context, room string, before int64) boo
 			return false
 		}
 		slog.Error("load history", "room", room, "err", err)
-		return c.reply(Outbound{Type: TypeError, Room: room, Text: "could not load history"})
+		return c.replyError(room, "could not load history")
 	}
 	return c.reply(Outbound{Type: TypeHistory, Room: room, Messages: msgs, More: more})
 }
 
-// validRoomName accepts 1-64 bytes of printable text. Control characters
-// (newlines, NUL, terminal escape codes) are refused: they can corrupt logs
-// and screens, and PostgreSQL can't store NUL at all.
+// roomPattern is the rule for room names: the same characters as
+// usernames (ASCII letters, digits, '_' and '-'), 1 to maxRoomName of them.
+var roomPattern = regexp.MustCompile(fmt.Sprintf(`^[A-Za-z0-9_-]{1,%d}$`, maxRoomName))
+
+// validRoomName reports whether room follows roomPattern.
+//
+// Everyone sees room names, so two different names must never look the
+// same. That rules out most of Unicode, which is full of characters that
+// show nothing at all (U+200B ZERO WIDTH SPACE, U+3164 HANGUL FILLER),
+// change nothing visible (U+034F COMBINING GRAPHEME JOINER, variation
+// selectors), turn text around (U+202E RIGHT-TO-LEFT OVERRIDE) or copy a
+// Latin letter exactly (U+0435, a Cyrillic letter that looks like "e").
+// An earlier version refused only what unicode.IsPrint calls unprintable,
+// and a review found seven characters that got past it. Telling Unicode
+// look-alikes apart is a hard problem (Unicode Technical Standard #39
+// describes how), so this rule lists the characters that are allowed
+// instead of the ones that are not. It also keeps out control characters,
+// which can corrupt logs and terminals, and NUL, which PostgreSQL can't
+// store.
 func validRoomName(room string) bool {
-	if room == "" || len(room) > maxRoomName {
-		return false
+	return roomPattern.MatchString(room)
+}
+
+// textProblem says what is wrong with a chat message, or returns "" if
+// nothing is.
+func textProblem(text string) string {
+	switch {
+	case len(text) > maxTextLength:
+		return "message too long"
+	case strings.ContainsRune(text, 0):
+		// PostgreSQL can't store the NUL character in text, and no
+		// human types one, so refuse it before it reaches the database.
+		return "message contains invalid characters"
 	}
-	return !strings.ContainsFunc(room, unicode.IsControl)
+	return ""
 }
 
 // reply sends a message to this client only. It goes through the hub,
@@ -216,23 +263,27 @@ func (c *Client) reply(m Outbound) bool {
 	return c.hub.submit(command{kind: cmdDirect, client: c, msg: m})
 }
 
+func (c *Client) replyError(room, text string) bool {
+	return c.reply(Outbound{Type: TypeError, Room: room, Text: text})
+}
+
 func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
+	// jpl:loop returns when the hub closes send, a write or ping fails, or
+	// ctx ends.
 	for {
 		select {
 		case msg, ok := <-c.send:
 			if !ok {
 				// The hub closed our channel: we were removed (too slow,
 				// or the server is shutting down). Tell the browser why.
-				c.conn.Close(c.goodbye.code, c.goodbye.text)
+				// An error means the socket is already closed.
+				_ = c.conn.Close(c.goodbye.code, c.goodbye.text)
 				return
 			}
-			wctx, wcancel := context.WithTimeout(ctx, writeTimeout)
-			err := wsjson.Write(wctx, c.conn, msg)
-			wcancel()
-			if err != nil {
+			if !c.write(ctx, msg) {
 				return
 			}
 		case <-ticker.C:
@@ -248,4 +299,11 @@ func (c *Client) writeLoop(ctx context.Context, cancel context.CancelFunc) {
 			return
 		}
 	}
+}
+
+// write sends one message, giving up after writeTimeout.
+func (c *Client) write(ctx context.Context, msg Outbound) bool {
+	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+	return wsjson.Write(wctx, c.conn, msg) == nil
 }

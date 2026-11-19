@@ -20,7 +20,8 @@
 <p>Test page for the server. Open it in two tabs, sign up as two different people, join the same room and chat.</p>
 
 <form id="account">
-  <input id="username" placeholder="username" autocomplete="username" required>
+  <input id="username" placeholder="username" autocomplete="username" required
+         pattern="[A-Za-z0-9_\-]{3,32}" title="3-32 letters, digits, _ or -">
   <input id="password" type="password" placeholder="password (8+ characters)" autocomplete="current-password" required>
   <button data-action="login">Log in</button>
   <button data-action="register">Sign up</button>
@@ -28,7 +29,8 @@
 <p id="whoami" class="system"></p>
 
 <form id="connect" class="hidden">
-  <input id="room" placeholder="room" value="general" required>
+  <input id="room" placeholder="room" value="general" required
+         pattern="[A-Za-z0-9_\-]{1,64}" title="1-64 letters, digits, _ or -">
   <button>Join room</button>
 </form>
 <button id="older" class="hidden">Load older messages</button>
