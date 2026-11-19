@@ -203,7 +203,8 @@ and Kubernetes send). When one arrives, a context is cancelled, the hub closes
 every chat connection with code 1001 ("going away", so browsers know to
 reconnect), and `srv.Shutdown` stops accepting new connections and waits up to
 10 seconds for HTTP requests already running. Section 2.13 explains a bug the
-first version of this had.
+first version of this had, and section 3.5 another one: the program could exit
+before those goodbyes were sent.
 
 ### 1.9 Limits that protect the server
 
@@ -649,6 +650,8 @@ which can fake extra lines in log files or recolour an admin's terminal. Now:
   could never have been registered fails like any wrong login (and still takes
   bcrypt time, so it leaks nothing).
 - Room names must be 1-64 bytes with no control characters (`unicode.IsControl`).
+  (Chapter 3 goes further: room names may only use ASCII letters, digits, `_`
+  and `-`. Section 3.6 tells why.)
 - Messages containing NUL are refused.
 
 The lesson: validate at the edge, as data comes in, and write down exactly what
@@ -690,7 +693,8 @@ any code (the read deadline killed the socket); now a timer closes it with
 4401. And on shutdown the server cancelled every request in progress the moment
 you pressed Ctrl+C, so a login running at that instant failed. Now `Shutdown`
 lets running requests finish, while the hub closes every chat connection with
-1001.
+1001. (Chapter 3 found that the program could still exit before those 1001s
+were sent: see section 3.5.)
 
 The hub records *why* it removed a client (`closeReason` in `hub.go`) just
 before closing that client's `send` channel, and the client's writer goroutine
@@ -761,3 +765,640 @@ goroutine that sees the close.
 **Next chapter:** making the repository professional: CI/CD, linters, security
 scanning, coverage, NASA/JPL's "Power of Ten" coding rules adapted to Go, and
 release automation.
+
+---
+
+## Chapter 3: A professional repository
+
+**Code for this chapter:** `.github/workflows/`, `.golangci.yml`,
+`internal/jplcheck/`, the `fuzz_test.go` files, `scripts/`, `Makefile`,
+`Dockerfile`, `.goreleaser.yaml` and `docs/CODING_STANDARDS.md`
+
+Chapters 1 and 2 built a server that works. This chapter builds the machinery
+that keeps it working when the next change comes from someone tired, someone
+new, or someone careless. Quality that depends on people remembering doesn't
+last. Checks that run by themselves on every change do.
+
+The idea behind all of it is called **shifting left**: catch each problem at
+the earliest, cheapest point.
+
+| Where | How soon | What runs |
+|---|---|---|
+| Your editor | as you type | `gofmt`, the Go language server |
+| `git commit` | seconds | pre-commit hooks: formatting, secret scanning, linters on changed code |
+| `git push` | a minute | all tests |
+| Pull request | about 5 minutes | the whole CI, CodeQL, dependency review, a human review |
+| Every day | scheduled | static analysis, the vulnerability scan, fuzzing |
+| A version tag | release | the tests again, binaries, Docker image, release notes |
+
+### 3.1 Continuous integration with GitHub Actions
+
+**Continuous integration (CI)** means every change is built and checked
+automatically, on a clean machine, before it is merged. "It works on my
+machine" stops being a defense. **Continuous delivery (CD)** means releasing is
+automated too: pushing a tag produces everything a user downloads.
+
+GitHub Actions runs **workflows**: YAML files in `.github/workflows/`. Here is
+the shape of `ci.yml`, shortened:
+
+```yaml
+on:                              # when to run
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *"         # every day at 06:17 UTC
+permissions:
+  contents: read                 # the job's token can read the code, nothing else
+jobs:
+  test:
+    runs-on: ubuntu-latest       # a fresh virtual machine for every run
+    strategy:
+      matrix:
+        go: [oldstable, stable]  # the job runs once per Go version
+    services:
+      postgres:                  # a real database next to the job
+        image: postgres:17
+    steps:
+      - uses: actions/checkout@v6      # a ready-made action
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - run: ./scripts/coverage.sh coverage.out   # a shell command
+```
+
+Jobs run in parallel, each on its own machine. A step either `uses:` an action
+someone published or `run:`s a command. `needs:` makes one job wait for others.
+
+| Job | What passing proves |
+|---|---|
+| Lint and static analysis | `go.mod` is tidy, `go vet` and about 50 linters find nothing, the JPL rules hold, the shell scripts are clean |
+| Test (twice) | every test passes with the race detector against a real PostgreSQL, on both supported Go versions, with at least 80% coverage |
+| Known vulnerabilities | no vulnerable function in our dependencies or the standard library is reachable from our code |
+| Build | the server compiles for Linux, macOS and Windows, and the Docker image builds |
+| Fuzz tests | (daily only) a minute of fuzzing per target finds nothing |
+| CI OK | every job above passed |
+
+A few details are worth copying into every project:
+
+- **Least privilege.** `permissions: contents: read` means the token a job
+  receives can read the code and do nothing else. Actions are code written by
+  other people, and they do get compromised: in March 2025 the popular
+  `tj-actions/changed-files` action was altered to print the secrets of the
+  workflows that used it into their build logs. A read-only token limits the damage. Only the release
+  workflow may write (to create the release and push the image).
+- **Pinned versions.** `golangci-lint` is pinned to an exact version, so a new
+  release with new checks can't turn the build red overnight. Upgrading is a
+  deliberate change, proposed by Dependabot. The strictest teams pin actions
+  to a full commit hash instead of a tag like `v6`, since a tag can be moved.
+- **One summary check.** Branch protection asks you to name the checks that
+  must pass. Naming every job means editing the settings whenever a job is
+  renamed, and the fuzz job is *skipped* on pull requests. So the last job,
+  "CI OK", `needs` all the others, always runs (`if: always()`), and fails
+  unless each one succeeded or was skipped. Require just that one.
+- **Two Go versions.** `go.mod` says `go 1.26.0`: the oldest Go this code
+  supports. CI tests on `oldstable` and `stable`, the two releases the Go team
+  still patches, so that promise is checked rather than hoped. Releases are
+  built with the newest Go, so they carry the latest standard-library fixes.
+- **Cancel stale runs.** `concurrency` with `cancel-in-progress` stops the run
+  for an older push when a newer one arrives.
+
+### 3.2 Linters: reading code for bugs without running it
+
+**Static analysis** means examining code without running it. The compiler is
+the first static analyzer; `go vet` is the second. **golangci-lint** runs about
+50 more in one pass. Each one is switched on in `.golangci.yml` with a comment
+saying what it catches.
+
+Switched on for the first time, they reported 93 findings in the code of steps
+1 and 2. Some examples, from then and from this step's new code:
+
+| Linter | What it found | Why it matters |
+|---|---|---|
+| `errcheck` | results of `conn.Close(...)` ignored | an error nobody looks at is a silent failure |
+| `noctx` | tests making HTTP requests and network connections without a context | a request without a context can't be cancelled, so it can hang forever |
+| `govet` (shadow) | an `err :=` inside a block that hid the outer `err` | the wrong error gets checked |
+| `funlen`, `gocognit` | functions too long or too tangled to read at once | split into small named steps |
+| `exhaustive` | a `switch` over command kinds without every kind | add a kind, forget the switch: caught before it ships |
+| `musttag` | a struct decoded from JSON without `json` tags | field names silently fail to match |
+
+The rule is **zero warnings**. A linter whose output nobody reads is worse than
+none: it teaches everyone to ignore it. Every finding is fixed, or silenced on
+that one line with the linter's name and a reason, which `nolintlint` enforces:
+
+```go
+return nil, nil //nolint:nilnil // the go/analysis API expects (nil, nil) here
+```
+
+**A real catch: "Trojan Source".** In 2021, researchers showed that invisible
+Unicode characters that change text direction (such as U+202E) can make source
+code *display* differently from how the compiler *reads* it, so a reviewer
+approves code that does something else (CVE-2021-42574). While this chapter's
+fuzz tests were being written, two invisible characters ended up in a test
+file as the characters themselves instead of escapes like `\u202e`. Three
+linters flagged it at once: `bidichk`, `gosec` (G116) and `staticcheck`
+(ST1018). The fix is to write them as escapes, which every reader can see.
+
+### 3.3 NASA/JPL's "Power of Ten", in Go
+
+In 2006 Gerard Holzmann of NASA's Jet Propulsion Laboratory published ten rules
+for the C code that flies on spacecraft. He chose rules that tools can check,
+because rules that only live in a document get forgotten. Not all of them make
+sense in Go (Go has no preprocessor and no pointer arithmetic), but their aim,
+code simple enough to be sure about, fits any server.
+[docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md) goes through all ten and
+names the tool that enforces each one. These are the ones that changed code.
+
+**Rule 1: no recursion.** With recursion, the depth of the stack depends on the
+input, so you can't prove the program won't run out of it. In step 2, removing
+a client was recursive, through four functions:
+
+```text
+removeClient -> leave -> broadcast -> dropSlow -> removeClient
+```
+
+Removing Alice announces "alice left" in each of her rooms. The announcement
+can find another client whose buffer is full, so that client is removed too,
+which announces another departure, and so on. How deep that goes depends on how
+many clients are slow at once, which an attacker can arrange by opening many
+connections that never read. Now `removeClient` keeps a queue instead:
+
+```go
+func (h *Hub) removeClient(c *Client, why closeReason) {
+	queue := []removal{{c, why}}
+	queued := map[*Client]bool{c: true} // who is already in the queue
+	for len(queue) > 0 {
+		next := queue[0]
+		queue = queue[1:]
+		gone := next.client
+		if !h.clients[gone] {
+			continue // already removed
+		}
+		delete(h.clients, gone)
+		for room := range gone.rooms {
+			for _, slow := range h.leave(gone, room) { // leave reports who was too slow
+				if !queued[slow] {
+					queued[slow] = true
+					queue = append(queue, removal{slow, byeSlow})
+				}
+			}
+		}
+		gone.goodbye = next.why
+		close(gone.send)
+	}
+}
+```
+
+It ends because each client enters the queue at most once, so the queue never
+holds more entries than there are clients. This is the general recipe: replace
+the call stack with your own list of work to do (a stack for depth-first order,
+a queue for breadth-first), plus a record of what is already in it.
+
+The first version had no `queued`, and a review caught what that cost. A slow
+client was added again by every announcement it missed while it waited its
+turn: with n slow clients sharing r rooms, about r × n² / 2 entries. The loop
+still ended, because removed clients are skipped, but memory wasn't bounded
+(rule 3). Measured with 500 slow clients in 100 shared rooms, one removal took
+1.3 GB of memory and 5.8 seconds; with `queued` it takes 5 MB and 0.7 seconds.
+Those 0.7 seconds are still the hub doing nothing else, because each departure
+is announced to everyone left in every room. Limits on connections per user
+(step 5) are what stop someone from setting that up.
+
+**Rule 2: every loop has a bound.** Loops over a slice or up to a number are
+bounded by their own syntax. A server also has loops that are *meant* to run
+until shutdown, like the hub's event loop. Here every loop without a condition,
+and every `range` over a channel, must say how it ends in a comment that starts
+with `jpl:loop`:
+
+```go
+// jpl:loop runs for the life of the server; returns when done is closed.
+for {
+```
+
+Even test code follows the rule. `replies` in `internal/chat/fuzz_test.go`
+reads until a marker message arrives. A client's buffer holds at most
+`sendBuffer` messages, so instead of `for {}` it loops `for range sendBuffer + 1`
+and fails the test if the marker never comes.
+
+**Rule 3: no unbounded memory.** The original rule bans allocating memory after
+start-up. Go needs its garbage collector, so we keep the spirit: nothing may
+grow without a limit. Every buffer, queue and input size has a maximum, listed
+in the coding standards. An attacker can make the server busy, but not make it
+run out of memory.
+
+**Rule 4: functions fit on a page.** `funlen` allows 60 lines and 40
+statements. For example, `Migrate` became three small functions
+(`lockMigrations`, `applyMigration` and what's left), and `pgx.BeginFunc`
+replaced hand-written commit and rollback calls: it commits when the function
+returns `nil` and rolls back otherwise, so no path can forget either one.
+
+**Rule 5: assertions.** Go has no `assert`, and a server should recover rather
+than crash. So: validate every input where it enters, check invariants
+explicitly (the hub ignores commands from clients it already removed, instead
+of sending on a closed channel), and let fuzz tests check properties on
+millions of inputs (section 3.6).
+
+**Rule 7: check every return value.** `errcheck` makes sure no error is
+dropped by accident. When ignoring one is truly right, the code says so with
+`_ =` and a comment. That's Go's version of the `(void)` cast JPL asks for in C:
+
+```go
+// The error only says the connection was already closed: nothing to do.
+_ = conn.Close(websocket.StatusNormalClosure, "")
+```
+
+**Rule 10: zero warnings, every day.** CI fails on any finding, and runs the
+analysis again every morning even if nobody pushed, because new vulnerabilities
+are published every day.
+
+### 3.4 Writing your own analyzer: jplcheck
+
+No existing Go linter checks rules 1 and 2, so this repository has its own:
+`internal/jplcheck`, about 450 lines on top of `golang.org/x/tools/go/analysis`,
+the same framework `go vet` is built on. An analyzer receives a `Pass`: the
+package's syntax trees (the code parsed into a tree of nodes) and its type
+information (what every name refers to).
+
+- **goto**: walk the tree and report every `goto` statement.
+- **Unbounded loops**: find `for` loops with no condition (or one that is
+  always `true`), and `range` loops over a channel or a function iterator
+  (that needs the type information), then look for a `jpl:loop` comment on
+  the line above.
+- **Recursion**: build a **call graph**. For every function call, the type
+  information says which function is called. That's an arrow from caller to
+  callee. Recursion is a cycle of arrows. **Tarjan's algorithm** finds all
+  strongly connected components (groups of functions that can all reach each
+  other) in one pass. It is normally written recursively, so jplcheck uses an
+  explicit stack; otherwise it would fail its own check. Then a breadth-first
+  search inside each group finds a real chain of calls to show you, such as
+  `alpha -> gamma -> beta -> alpha`.
+
+Its limit: a call through an interface or a function value can't be resolved
+without running the program, so those arrows are missing. Review still matters.
+
+A review tried to fool it, and found nine problems. The biggest: the first version
+worked out which function a call goes to by looking at the shape of the code,
+and missed shapes it hadn't thought of. A method of a generic type called
+through another instantiation (`box[int]{}.get()` is a *different* function
+object from the declared `get`), a method expression (`counter.down(c, n)`)
+and `pair[A, B](x)` all went unnoticed. The fix was to stop doing it by hand:
+`typeutil.StaticCallee` from `x/tools` handles every shape and returns the
+declared function. Others: a `range` over a channel hidden behind a type
+parameter (`func f[C ~chan int](c C)`), a labeled loop documented above its
+label, and `/* jpl:loop */` counting as a reason. Each one is now a case in
+`testdata/src/a/review.go`. The lesson for any tool that reads code: test it
+with the strangest *valid* code you can write.
+
+Analyzers are tested with `analysistest`: it runs the analyzer on files in
+`testdata/`, where comments say which reports must appear on which line.
+
+```go
+func countdown(n int) int { // want `recursion: countdown -> countdown`
+```
+
+### 3.5 Tests you can trust
+
+**Coverage** measures which lines ran during the tests. `scripts/coverage.sh`
+passes `-coverpkg=./...`, so a line counts as covered whichever package's tests
+ran it: the end-to-end tests in `internal/app` exercise the chat and auth code
+too. CI fails below 80%. That floor catches large untested additions, but
+coverage is not a goal in itself: it tells you a line *ran*, not that anyone
+checked what it did. A test with no assertions can reach 100%.
+
+**Making `main` testable.** `main` used to read the environment and start
+serving, so it had no tests. Now it calls `run(ctx, getenv, listening)`.
+Production passes `os.Getenv`; tests pass a map, so they never depend on (or
+change) the real environment. One test starts the real server with
+`ADDR=127.0.0.1:0`, which lets the operating system pick a free port, and
+`listening` tells the test which one it picked. (Asking for a free port first
+and passing it in has a race: something else can take the port in between.)
+Then it cancels the context the way Ctrl+C would, and checks that the server
+stops cleanly. While writing it, the order of startup changed: the server now
+opens its port *before* the slow setup (a quarter second of bcrypt), so a port
+that's already taken fails immediately instead of after the wait.
+
+A test should also fail quickly and say why. Every wait in these tests has a
+timeout, including each HTTP request (`http.DefaultClient` has none, so a
+server that accepts a connection and never answers would hang the test for ten
+minutes, until `go test` gives up).
+
+**Shutting down properly.** A review found that the server could exit before
+saying goodbye. `srv.Shutdown` waits for ordinary HTTP requests, but a
+WebSocket has left the HTTP server's hands (it was "hijacked" during the
+upgrade), so `Shutdown` returned at once and `main` exited, while each
+connection's writer was still sending its close frame. With 50 clients
+connected, often more than half never got their 1001; their browsers saw the
+connection simply drop (1006) and showed "Disconnected" instead of "The server
+is restarting".
+
+The fix counts connections with a `sync.WaitGroup`. `Handler.ServeHTTP` adds
+one when a request arrives, *before* the upgrade (after it, nothing else
+tracks the connection, and `Shutdown` could already have returned), and
+removes it when the connection has completely finished. `Hub.Wait` waits until
+the hub has stopped and the count is zero, and `run` calls it after `Shutdown`,
+within the same 10 seconds. A connection that arrives while the server is
+stopping gets 1001 too.
+
+The test for it is worth a look (`TestRunStartsAndStops`). Its chat client
+doesn't read at first, so the server's close handshake can't finish yet, and
+`run` must still be running 300 ms after the cancel. Then the client reads,
+gets 1001, answers, and `run` returns. Without the fix, `run` returns
+immediately and the test fails. A test like this, built so it can only pass if
+the code waits, is far more reliable than one that hopes to catch a race.
+
+### 3.6 Fuzzing: let a program hunt for your bugs
+
+In a unit test you choose the inputs and the expected outputs. In **fuzzing**,
+a program generates the inputs: millions of them, mutating the ones that reach
+code no earlier input reached (that's "coverage-guided"). You can't write the
+expected output for an input you've never seen, so instead you write a
+**property**: something that must be true for *every* input.
+
+Go has fuzzing built in:
+
+```go
+func FuzzLogin(f *testing.F) {
+	f.Add("correct horse battery", "") // seed inputs
+	s := newService(f)
+	f.Fuzz(func(t *testing.T, password, suffix string) {
+		// Register an account with password, then log in with password+suffix.
+		// Property: the login succeeds exactly when suffix is "".
+	})
+}
+```
+
+`go test` runs only the seeds (and any saved failures), as ordinary tests, so
+they cost almost nothing in CI.
+`go test -run '^$' -fuzz '^FuzzLogin$' ./internal/auth` keeps generating inputs
+until you stop it or a property fails. A failing input is saved under
+`testdata/fuzz/FuzzLogin/` and runs as a seed from then on, so the bug can never
+come back unnoticed. CI fuzzes every target for a minute each day.
+
+Properties come in a few kinds, and this repository uses all of them:
+
+| Kind of property | Example here |
+|---|---|
+| It never crashes | `FuzzParseToken`: any string, from anyone on the internet |
+| Only valid things get through | `FuzzHandleFrame`: whatever a WebSocket frame says, nothing invalid reaches the store, and every reply makes sense |
+| Planned answers only | `FuzzAccountAPI`: any request body gets a 2xx or 4xx in JSON, never a 500 |
+| Round trip | `FuzzTokenRoundTrip`: parsing an issued token gives back the same user |
+| Two implementations agree | `FuzzMemoryStoreHistory`: the binary search agrees with a slow, obviously correct model (this is called **differential testing**) |
+| Code matches its spec | `FuzzValidateUsername`: the regular expression agrees with the rule written in plain code |
+| The security promise | `FuzzLogin`: the exact password works, and nothing else does |
+
+**What the fuzzer found: a login bug.** `FuzzLogin` failed after 42 seconds and
+about 60,000 attempts, with this:
+
+```text
+the account with password "000…000" (72 zeros) also opens with "000…0000" (73 zeros)
+```
+
+The cause is how bcrypt turns a password into a key. It adds a NUL byte to the
+end, repeats the result until it fills 72 bytes, and ignores everything after
+byte 72. Sign-up already refused passwords over 72 bytes, but login didn't, so
+for a 72-byte password anything typed after it was ignored. Thinking about the
+"repeats" part revealed a second case that random mutation would hardly ever
+find, so it became a seed: `password` and `password\x00password` make the
+same 72-byte key, `password␀password␀password␀…`.
+
+The danger is small here (you still need the real password), but the same
+property has caused real breaches. In 2024 Okta found that one of its login
+paths made a cache key by bcrypt-hashing the user id, username and password
+together. For usernames of 52 characters or more, the password fell past byte
+72 and was ignored, so under certain conditions someone could log in with the
+right username and any password.
+
+The fix is `hashable` in `internal/auth/user.go`: a password must be at most 72
+bytes and contain no NUL. With both rules, the first NUL in the key marks
+exactly where the password ends, so two different passwords always make
+different keys. Sign-up checks it (as part of `ValidatePassword`) and so does
+login. Login must *not* check the other rules, like the minimum length: if that
+minimum goes up one day, people with older, shorter passwords must still be able
+to log in. Algorithm limits never change; policies do.
+
+**What writing a property revealed: look-alike rooms.** To check that
+`FuzzHandleFrame` never lets an invalid room through, the test needs its own
+definition of a valid room name, written independently of the code. Writing it
+raised the question: is `gen\u200beral` (with a zero-width space in it) valid?
+Or `\u202elareneg`? The right-to-left override at its start makes the letters
+after it display backwards, so it shows as "general". The old rule only refused
+control characters, so both were accepted, and anyone could create a room that
+looks exactly like `general` to collect messages meant for it.
+
+The first fix accepted only "printable" characters (`unicode.IsPrint`). A review
+then found seven characters that count as printable and still fool the eye:
+
+| Character | What it looks like |
+|---|---|
+| U+3164 HANGUL FILLER, U+115F HANGUL CHOSEONG FILLER | nothing: Unicode calls them letters |
+| U+2800 BRAILLE PATTERN BLANK | a space |
+| U+034F COMBINING GRAPHEME JOINER | nothing: it only changes how text sorts |
+| U+FE0F and U+E0100, variation selectors | nothing after a letter |
+| U+0435 CYRILLIC SMALL LETTER IE | exactly like the Latin `e` |
+
+Telling look-alikes apart properly is a big job. Unicode publishes a standard
+for it (UTS #39, "Unicode Security Mechanisms"): it maps every character to a
+"skeleton" (both `e`s become the same), so two names whose skeletons match are
+called confusable, and it defines rules against mixing scripts in one name.
+Browsers use these rules to decide when to show a web address as
+`xn--...` instead of in Unicode.
+
+For room names here, the simple answer wins: they follow the same rule as
+usernames, ASCII letters, digits, `_` and `-` (`^[A-Za-z0-9_-]{1,64}$`). This is
+an **allow-list**, and that's the real lesson. A deny-list has to name every
+dangerous character, including ones Unicode adds next year, and the first fix
+showed how easy it is to miss some. An allow-list fails safe: anything nobody
+thought about is refused. The price: no spaces, accents or emoji in room
+names. Message text stays free. (Even ASCII has look-alikes, like `l` and `I`
+in some fonts. Exercise 10 is about doing better.)
+
+**What a property taught: JSON can't carry broken text.** `FuzzTokenRoundTrip`
+only holds for names that are valid UTF-8. `encoding/json` quietly replaces
+invalid bytes with U+FFFD (�), so a name containing the byte `0xff` would come
+back changed. Our usernames are ASCII, so it can't happen here, but remember it
+whenever you compare a value before and after JSON.
+
+**What a review found: two properties that couldn't fail.** A property is only
+useful if breaking the code breaks it. The review checked that by breaking the
+code on purpose (this is called **mutation testing**):
+
+- `FuzzParseToken` said "never accept a token we didn't sign", but it only
+  checked that an accepted token carried our user's id and name. The
+  `"alg": "none"` seed carries exactly those, without a signature. With
+  signature checking switched off completely, every seed still passed. Now an
+  accepted token must be ours, byte for byte, except for one harmless detail:
+  the signature may be spelled differently (`respell` in the test shows how
+  two base64 strings can decode to the same bytes).
+- `FuzzAccountAPI` said "never a 500", but its memory store can't fail, so no
+  input could ever cause one. Now its store fails the way PostgreSQL does
+  when a username contains NUL, so if a NUL ever slipped past the checks, the
+  test would see a 500. It also starts every input from a fresh store with one
+  known account. Before, an answer could depend on what earlier inputs had
+  registered, so a saved failure might not repeat when run on its own.
+
+Tips for writing fuzz tests:
+
+- Keep each run fast and independent: no sleeping, no network, fresh state
+  per input (`FuzzHandleFrame` starts a new hub for every frame).
+- Cap the work per input: `saves[:min(len(saves), 300)]`.
+- Check that each property can fail: break the code on purpose and run the
+  seeds.
+- Make failures readable: `%#v` and `%q` print control and format characters
+  as escapes such as `\u200b`. `%+q` also escapes everything outside ASCII,
+  so even a Hangul filler shows up as `\u3164`.
+- Reproduce a failure with `go test -run=FuzzLogin/87bcaa77e3332f0b ./internal/auth`.
+
+### 3.7 The supply chain: other people's code
+
+Most of the code in our binary isn't ours: it's Go's standard library and the
+modules in `go.mod`. A professional repository watches that code too.
+
+- **govulncheck** compares our dependencies with the Go vulnerability database.
+  Unlike simpler scanners, it checks whether our code can actually *reach* the
+  vulnerable function through the call graph, so it doesn't cry wolf. It covers
+  the standard library too, which is why releases are built with the newest Go.
+- **Dependabot** opens a pull request every week when a Go module, a GitHub
+  Action or the Docker base image has a new version. CI tests each one.
+- **Dependency review** fails a pull request that adds a dependency with a
+  known vulnerability of moderate severity or worse.
+- **CodeQL**, GitHub's code scanner, turns the code into a database and runs
+  queries on it, such as "can data from an HTTP request reach a SQL query
+  without passing through a parameter?" (this is called **taint tracking**).
+  Results appear in the repository's Security tab.
+- **Secrets**: `.env` is ignored by git, the `gitleaks` pre-commit hook blocks
+  commits that contain keys or tokens, and GitHub's secret scanning catches
+  anything that slips through.
+- **SBOM and provenance**: each release image ships with a Software Bill of
+  Materials (a list of every package inside it) and a signed provenance
+  statement (which workflow built it, from which commit). When the next big
+  vulnerability in a popular library is announced, an SBOM answers "are we
+  affected?" in seconds.
+
+### 3.8 Containers and releases
+
+The `Dockerfile` has two stages:
+
+```dockerfile
+FROM golang:1.27-alpine AS build          # stage 1: has the Go toolchain
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download                       # cached until go.mod changes
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/realtime-chat ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot   # stage 2: what ships
+COPY --from=build /out/realtime-chat /realtime-chat
+USER nonroot:nonroot
+ENTRYPOINT ["/realtime-chat"]
+```
+
+Only the second stage ships: no compiler, no shell, no package manager, just
+our binary and a few files. The image is about 22 MB, and an attacker who
+breaks into the process finds almost no tools and no root user. The build
+flags matter too: `CGO_ENABLED=0` makes a fully static binary, `-trimpath`
+keeps your machine's folder names out of it, `-s -w` drops debugging symbols,
+and `-X main.version=...` writes the version into the `version` variable, which
+the server logs at startup.
+
+**Versions** follow Semantic Versioning, `MAJOR.MINOR.PATCH`: a bug fix bumps
+PATCH, a new feature bumps MINOR, a breaking change bumps MAJOR. Before 1.0.0,
+anything may still change. Pushing a tag like `v0.3.0` starts the release
+workflow: it runs the tests again, **GoReleaser** cross-compiles the binaries,
+packs them with checksums and writes release notes, and **Docker Buildx**
+builds the image for both Intel and ARM servers and pushes it to the GitHub
+Container Registry.
+
+The release notes write themselves because commit messages follow
+**Conventional Commits** (`feat: ...`, `fix: ...`, `docs: ...`): a program can
+read the history, group the changes, and even suggest the next version number
+(any `feat` means a new minor version). `CHANGELOG.md` is the human-written
+companion, in the Keep a Changelog format.
+
+### 3.9 Everything else a good repository has
+
+- **Makefile**: one short command per task, the same ones CI runs. `make help`
+  lists them.
+- **pre-commit hooks**: `make hooks` installs checks that run on every commit
+  (formatting, secrets, linters on what changed) and on every push (the tests).
+- **.editorconfig**: tells every editor to use tabs in Go, spaces in YAML, and
+  end files with a newline.
+- **Issue forms and a pull request template**: they ask for the information a
+  maintainer needs, so reports arrive complete.
+- **CODEOWNERS**: GitHub asks the owner to review every pull request.
+- **CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md**: how to help, how to
+  report a vulnerability privately, and how people treat each other.
+- **Badges**: the README shows the CI status, the latest release and more.
+  A badge is a claim; CI is what makes it true.
+
+Some protections are repository settings, which only the owner can change.
+Recommended for `main`: require a pull request, require the "CI OK", CodeQL and
+dependency review checks to pass, require branches to be up to date before
+merging, and block force pushes. Also turn on secret scanning with push
+protection, private vulnerability reporting, and "automatically delete head
+branches".
+
+### 3.10 Try it yourself
+
+1. Run `make help`, then `make check`. Which step takes longest?
+2. Break rule 1 on purpose. Add this to any package and run `make jpl`:
+
+   ```go
+   func factorial(n int) int {
+   	if n <= 1 {
+   		return 1
+   	}
+   	return n * factorial(n-1)
+   }
+   ```
+
+   Rewrite it with a loop, and run `make jpl` again.
+3. Delete the `jpl:loop` comment above the hub's `for {` and run `make jpl`.
+   Then put it back.
+4. Bring the bcrypt bug back: in `Login` (`internal/auth/service.go`), remove
+   `|| !hashable(password)` and run `go test ./internal/auth`. The saved input
+   in `testdata/fuzz/FuzzLogin/` fails at once. Now move that file away and run
+   `go test -run '^$' -fuzz '^FuzzLogin$' ./internal/auth`. How long does the
+   fuzzer take to find the bug on its own? Restore everything afterwards.
+5. **Exercise:** write `FuzzBearerToken` for `auth.BearerToken`. Two properties
+   to start with: the result never starts or ends with a space, and for any
+   token without spaces at its ends, the header `Bearer <token>` gives back
+   exactly that token.
+6. Build and look inside the image: `docker build -t realtime-chat .`, then
+   `docker images realtime-chat` for its size, and try
+   `docker run --rm -it --entrypoint sh realtime-chat`. Why does that fail?
+7. Do a release dry run: `goreleaser release --snapshot --clean`, then look in
+   `dist/`. Run the binary for your machine and read the version it logs.
+8. **Think about it:** CI requires 80% coverage. Write a test that raises
+   coverage without being able to catch any bug. What does that tell you about
+   coverage as a target?
+9. Remove `queued` from `removeClient` (keep the `append`) and run
+   `go test ./internal/chat`. Do the tests notice? Write a benchmark with 300
+   slow clients that share 50 rooms, run it with `go test -bench . -benchmem`
+   with and without `queued`, and compare.
+10. **Exercise:** allow Unicode room names safely. Normalize names to NFC
+    (`golang.org/x/text/unicode/norm`), refuse names that mix scripts, and
+    refuse a new room whose UTS #39 skeleton matches an existing room's. Which
+    of the seven characters in section 3.6 does each rule stop?
+
+### Interview questions this chapter prepares you for
+
+- What's the difference between continuous integration, delivery and deployment?
+- What would you put in the CI pipeline of a Go web service? How do you keep it fast?
+- What is static analysis? Name a bug a linter finds that tests usually miss.
+- What is a software supply-chain attack, and what can a repository do about it?
+- Why do safety-critical coding standards ban recursion? How do you turn a
+  recursive algorithm into a loop?
+- What is fuzzing? What makes a good property? What is differential testing?
+- What does code coverage tell you, and what doesn't it?
+- How does bcrypt treat long passwords, and how can that become a security bug?
+- What is the "Trojan Source" attack?
+- For input validation, would you use an allow-list or a deny-list? Why?
+- What is mutation testing? How do you know a test can fail?
+- How do you shut down a server that holds WebSocket connections gracefully?
+- What is semantic versioning? How do you choose the next version number?
+- Why build Docker images in stages, and why run as a non-root user?
+- What is an SBOM, and why would a customer ask for one?
+
+**Next chapter:** a React and TypeScript frontend, and direct messages.
