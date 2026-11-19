@@ -67,7 +67,8 @@ func TestLoginReportsBusyWhenHashSlotsAreFull(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Routes(mux)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"alice","password":"whatever-password"}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/login",
+		strings.NewReader(`{"username":"alice","password":"whatever-password"}`))
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("status %d, Retry-After %q; want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
