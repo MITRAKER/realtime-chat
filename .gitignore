@@ -6,10 +6,10 @@
 /bin/
 /dist/
 
-# Test and coverage output
+# Test and coverage output (only at the top level: scripts/coverage.sh is code)
 *.out
 *.test
-coverage.*
+/coverage.*
 
 # Editors and OS files
 .idea/
