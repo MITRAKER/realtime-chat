@@ -76,7 +76,7 @@ jobs:
           check-latest: true
       - name: Test with coverage (fails below 80%)
         run: ./scripts/coverage.sh coverage.out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always() && matrix.go == 'stable'
         with:
           name: coverage
@@ -112,9 +112,9 @@ jobs:
             echo "building $target"
             GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/server
           done
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Docker image builds
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -135,7 +135,7 @@ jobs:
         run: ./scripts/fuzz.sh 60s
       # If the fuzzer finds a crash, it saves the input under testdata/fuzz.
       # Keep it so the bug can be reproduced and added as a regression test.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-crashers
