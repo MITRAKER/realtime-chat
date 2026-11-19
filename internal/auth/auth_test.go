@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,27 +21,29 @@ import (
 
 var secret = []byte("test-secret-that-is-at-least-32-bytes-long")
 
-func newTokens(t *testing.T) *auth.Tokens {
-	t.Helper()
+// newTokens and newService take testing.TB, the interface shared by tests
+// (*testing.T), benchmarks and fuzz tests (*testing.F), so all can use them.
+func newTokens(tb testing.TB) *auth.Tokens {
+	tb.Helper()
 	tokens, err := auth.NewTokens(secret, time.Hour)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return tokens
 }
 
-func newService(t *testing.T) *auth.Service {
-	t.Helper()
+func newService(tb testing.TB) *auth.Service {
+	tb.Helper()
 	// bcrypt.MinCost keeps tests fast; production uses DefaultBcryptCost.
-	s, err := auth.NewService(auth.NewMemoryUserStore(), newTokens(t), bcrypt.MinCost)
+	s, err := auth.NewService(auth.NewMemoryUserStore(), newTokens(tb), bcrypt.MinCost)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return s
 }
 
 func TestMemoryUserStoreContract(t *testing.T) {
-	authtest.Run(t, func(t *testing.T) auth.UserStore { return auth.NewMemoryUserStore() })
+	authtest.Run(t, func(*testing.T) auth.UserStore { return auth.NewMemoryUserStore() })
 }
 
 func TestNewTokensRejectsWeakSettings(t *testing.T) {
@@ -132,6 +135,7 @@ func TestRegisterValidates(t *testing.T) {
 		{strings.Repeat("a", 33), "long-enough-pass"}, // name too long
 		{"alice", "short"},                            // password too short
 		{"alice", strings.Repeat("x", 73)},            // over bcrypt's 72-byte limit
+		{"alice", "pass\x00word-long"},                // NUL: see hashable in user.go
 		{"alice", "ééé"},                              // 6 bytes but only 3 characters
 	}
 	for _, c := range cases {
@@ -152,7 +156,7 @@ func TestRegisterThenLogin(t *testing.T) {
 	if reg.Token == "" || reg.User.Username != "Alice" || reg.User.ID == 0 {
 		t.Fatalf("session = %+v", reg)
 	}
-	if _, err := s.Register(ctx, "alice", "another password"); !errors.Is(err, auth.ErrUsernameTaken) {
+	if _, err = s.Register(ctx, "alice", "another password"); !errors.Is(err, auth.ErrUsernameTaken) {
 		t.Fatalf("duplicate register err = %v", err)
 	}
 	login, err := s.Login(ctx, "ALICE", "correct horse battery")
@@ -189,93 +193,108 @@ func TestPasswordIsHashedWithSalt(t *testing.T) {
 
 // --- HTTP API ---
 
-func newAPI(t *testing.T) (*httptest.Server, *auth.Service) {
+func newAPI(t *testing.T) *httptest.Server {
 	t.Helper()
 	s := newService(t)
 	mux := http.NewServeMux()
 	s.Routes(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, s
+	return srv
 }
 
-func post(t *testing.T, url, body string) (int, map[string]any) {
+// send makes a request and returns the status code, the headers and the
+// body. It reads and closes the body itself, so no test can forget to.
+func send(t *testing.T, method, url, authorization, body string) (status int, header http.Header, data []byte) {
 	t.Helper()
-	res, err := http.Post(url, "application/json", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
-	if ct := res.Header.Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q", ct)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
 	}
-	var out map[string]any
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	return res.StatusCode, out
-}
-
-func TestHTTPRegisterLoginMe(t *testing.T) {
-	srv, _ := newAPI(t)
-
-	code, body := post(t, srv.URL+"/api/register", `{"username":"bob","password":"hunter2hunter2"}`)
-	if code != http.StatusCreated || body["token"] == "" {
-		t.Fatalf("register: %d %v", code, body)
-	}
-	if _, leaked := body["user"].(map[string]any)["passwordHash"]; leaked {
-		t.Fatal("password hash leaked in response")
-	}
-
-	code, body = post(t, srv.URL+"/api/register", `{"username":"BOB","password":"hunter2hunter2"}`)
-	if code != http.StatusConflict {
-		t.Fatalf("duplicate register: %d %v", code, body)
-	}
-
-	code, body = post(t, srv.URL+"/api/login", `{"username":"bob","password":"wrong-password"}`)
-	if code != http.StatusUnauthorized || body["error"] != "invalid username or password" {
-		t.Fatalf("bad login: %d %v", code, body)
-	}
-
-	code, body = post(t, srv.URL+"/api/login", `{"username":"bob","password":"hunter2hunter2"}`)
-	if code != http.StatusOK {
-		t.Fatalf("login: %d %v", code, body)
-	}
-	token := body["token"].(string)
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/me", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
+	data, err = io.ReadAll(res.Body)
+	if closeErr := res.Body.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.StatusCode, res.Header, data
+}
+
+// post sends JSON and decodes the JSON answer.
+func post(t *testing.T, url, body string) (status int, out map[string]any) {
+	t.Helper()
+	status, header, data := send(t, http.MethodPost, url, "", body)
+	if ct := header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decode %q: %v", data, err)
+	}
+	return status, out
+}
+
+const bobCredentials = `{"username":"bob","password":"hunter2hunter2"}`
+
+func TestHTTPRegister(t *testing.T) {
+	srv := newAPI(t)
+	code, body := post(t, srv.URL+"/api/register", bobCredentials)
+	if code != http.StatusCreated || body["token"] == "" {
+		t.Fatalf("register: %d %v", code, body)
+	}
+	user, ok := body["user"].(map[string]any)
+	if !ok {
+		t.Fatalf("no user in response: %v", body)
+	}
+	if _, leaked := user["passwordHash"]; leaked {
+		t.Fatal("password hash leaked in response")
+	}
+	code, body = post(t, srv.URL+"/api/register", `{"username":"BOB","password":"hunter2hunter2"}`)
+	if code != http.StatusConflict {
+		t.Fatalf("duplicate register: %d %v", code, body)
+	}
+}
+
+func TestHTTPLoginAndMe(t *testing.T) {
+	srv := newAPI(t)
+	if code, body := post(t, srv.URL+"/api/register", bobCredentials); code != http.StatusCreated {
+		t.Fatalf("register: %d %v", code, body)
+	}
+	code, body := post(t, srv.URL+"/api/login", `{"username":"bob","password":"wrong-password"}`)
+	if code != http.StatusUnauthorized || body["error"] != "invalid username or password" {
+		t.Fatalf("bad login: %d %v", code, body)
+	}
+
+	code, body = post(t, srv.URL+"/api/login", bobCredentials)
+	token, ok := body["token"].(string)
+	if code != http.StatusOK || !ok {
+		t.Fatalf("login: %d %v", code, body)
+	}
+	code, _, data := send(t, http.MethodGet, srv.URL+"/api/me", "Bearer "+token, "")
 	var me auth.User
-	if err := json.NewDecoder(res.Body).Decode(&me); err != nil || res.StatusCode != http.StatusOK || me.Username != "bob" {
-		t.Fatalf("me: %d %+v %v", res.StatusCode, me, err)
+	if err := json.Unmarshal(data, &me); err != nil || code != http.StatusOK || me.Username != "bob" {
+		t.Fatalf("me: %d %+v %v", code, me, err)
 	}
 }
 
 func TestHTTPMeRequiresToken(t *testing.T) {
-	srv, _ := newAPI(t)
+	srv := newAPI(t)
 	for _, header := range []string{"", "Bearer", "Bearer nonsense", "Basic dXNlcjpwYXNz"} {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/me", nil)
-		if header != "" {
-			req.Header.Set("Authorization", header)
-		}
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res.Body.Close()
-		if res.StatusCode != http.StatusUnauthorized {
-			t.Errorf("Authorization %q: status %d, want 401", header, res.StatusCode)
+		if code, _, _ := send(t, http.MethodGet, srv.URL+"/api/me", header, ""); code != http.StatusUnauthorized {
+			t.Errorf("Authorization %q: status %d, want 401", header, code)
 		}
 	}
 }
 
 func TestHTTPRejectsBadBodies(t *testing.T) {
-	srv, _ := newAPI(t)
+	srv := newAPI(t)
 	huge := `{"username":"` + strings.Repeat("a", 10_000) + `","password":"x"}`
 	for _, body := range []string{"", "not json", "[1,2,3]", huge} {
 		code, out := post(t, srv.URL+"/api/register", body)
@@ -291,7 +310,7 @@ func TestBearerToken(t *testing.T) {
 		"": "", "Bearer": "", "Basic abc": "", "abc": "",
 	}
 	for header, want := range cases {
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody)
 		r.Header.Set("Authorization", header)
 		if got := auth.BearerToken(r); got != want {
 			t.Errorf("BearerToken(%q) = %q, want %q", header, got, want)

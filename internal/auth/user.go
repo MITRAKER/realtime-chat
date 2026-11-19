@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -80,5 +81,27 @@ func ValidatePassword(password string) error {
 	if len(password) > MaxPasswordBytes {
 		return &ValidationError{Field: "password", Message: fmt.Sprintf("must be at most %d bytes", MaxPasswordBytes)}
 	}
+	if !hashable(password) {
+		return &ValidationError{Field: "password", Message: "must not contain the NUL character"}
+	}
 	return nil
+}
+
+// hashable reports whether bcrypt can tell this password apart from every
+// other password. bcrypt turns a password into a 72-byte key: it adds a
+// NUL byte to the end, repeats the result until it fills 72 bytes, and
+// ignores anything beyond that. So without these limits, different
+// passwords make the same key and open the same account:
+//
+//   - a 72-byte password, and the same password with anything added;
+//   - "password", and "password\x00password" (the key repeats either way).
+//
+// Without NUL bytes, and at most 72 bytes long, two different passwords
+// always make different keys. FuzzLogin found the first case on its own.
+//
+// These are limits of the algorithm, not rules about strong passwords, so
+// Login checks them too. (Login must not check the other rules: if the
+// minimum length goes up one day, old accounts must still be able to log in.)
+func hashable(password string) bool {
+	return len(password) <= MaxPasswordBytes && !strings.ContainsRune(password, 0)
 }
