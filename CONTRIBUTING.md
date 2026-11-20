@@ -74,14 +74,16 @@ Add `!` after the type for a breaking change (`feat!: ...`).
 | Correctness | `go test -race` with PostgreSQL, on the two supported Go releases | a test fails or a data race is found |
 | Coverage | `scripts/coverage.sh` | total coverage is below 80% |
 | Known vulnerabilities | `govulncheck` | the code calls a vulnerable function |
-| Security bugs | CodeQL | a new alert appears |
-| Risky dependency changes | Dependency review | a PR adds a dependency with a known vulnerability |
-| Builds | `go build`, Docker | any release platform or the image fails to build |
+| Security bugs | CodeQL | the change adds an alert of severity "error", or a security alert rated high or critical |
+| Risky dependency changes | Dependency review | a PR adds a dependency with a known vulnerability of moderate severity or worse |
+| Builds | `go build`, `goreleaser check`, Docker | a release platform or the image fails to build, or the release configuration is invalid |
 | Fuzz tests (daily) | `scripts/fuzz.sh` | a fuzz test finds an input that breaks its property |
 
 **CI OK** passes only when every job of the CI workflow passed, so it is the
-one check to require in branch protection, together with CodeQL and
-dependency review, which run as separate workflows.
+one CI check to require in branch protection, together with **CodeQL** and
+**Dependency review**, which run as separate workflows. Dependency review
+needs the repository's dependency graph, which the owner switches on under
+Settings, Advanced Security.
 
 ## Releases
 

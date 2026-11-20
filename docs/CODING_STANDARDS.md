@@ -17,14 +17,14 @@ on every pull request.
 |---|------------------|--------------------|-------------|
 | 1 | Simple control flow: no `goto`, no recursion | Same. Also limit nesting and complexity | `jplcheck`, `nestif`, `gocognit`, `gocyclo` |
 | 2 | Every loop has a fixed upper bound | Loops over data are bounded by limits. Loops that run "until shut down" must document how they end | `jplcheck` (`jpl:loop` comments), code review |
-| 3 | No dynamic memory allocation after start-up | Go needs the heap, so instead every queue, buffer and input has a hard maximum size | limits table below, tests, review |
+| 3 | No dynamic memory allocation after start-up | Go needs the heap, so instead every queue, buffer and input has a hard maximum size; connection counts get theirs in step 5 | limits table below, tests, review |
 | 4 | Functions fit on one page (about 60 lines) | Max 60 lines and 40 statements | `funlen` |
 | 5 | At least two assertions per function | Validate every input at trust boundaries; check invariants explicitly; fuzz tests | review, `go test -fuzz` |
 | 6 | Declare data at the smallest possible scope | Same; package-level state only for constants, errors and embedded files | compiler, `ineffassign`, `wastedassign`, review |
 | 7 | Check every return value and every parameter | Every `error` is handled; ignoring one needs an explicit `_ =` | `errcheck`, `nilerr`, `errorlint`, review |
 | 8 | Limit the preprocessor | Go has none. No cgo, no `unsafe`, no build-tag variants | `CGO_ENABLED=0` builds, `gosec` (G103) |
-| 9 | Limit pointers; no function pointers | Go has no pointer arithmetic. Function values only for handlers and callbacks | `gosec`, review |
-| 10 | All warnings on, zero warnings, daily static analysis | CI fails on any finding; analysis and vulnerability scans also run every day | CI, `golangci-lint`, `go vet`, CodeQL, `govulncheck` |
+| 9 | Limit pointers; no function pointers | Go has no pointer arithmetic. Function values only for handlers, callbacks and injected dependencies | `gosec`, review |
+| 10 | All warnings on, zero warnings, daily static analysis | CI fails on any finding (CodeQL: on serious new alerts); analysis and vulnerability scans also run every day | CI, `golangci-lint`, `go vet`, CodeQL, `govulncheck` |
 
 ## Rule 1: simple control flow
 
@@ -59,10 +59,12 @@ must cover those.
 **In Go:** loops over data are naturally bounded (ranging over a slice, or a
 counter compared to a limit). A server also has loops that are *meant* to run
 until shutdown: the hub's event loop, each connection's read and write loops.
-The rule's own exception covers these ("non-terminating" loops). We require
-every loop that has no condition (or one that is always true), or ranges over
-a channel or a function iterator, to have a comment directly above it (or
-above its label) that starts with `jpl:loop` and says how it ends:
+Holzmann exempts loops that are meant never to end, but for those he asks for
+the reverse proof: that they *can't* end. Ours do end, at shutdown, so neither
+version fits, and this repository relaxes the rule for them. Instead of a
+fixed bound, every loop that has no condition (or one that is always true),
+or ranges over a channel or a function iterator, must have a comment directly
+above it (or above its label) that starts with `jpl:loop` and says how it ends:
 
 ```go
 // jpl:loop ends when done is closed (server shutdown).
@@ -80,7 +82,10 @@ memory that grows without limit eventually runs out.
 
 **In Go:** the garbage collector is not optional, so we keep the spirit:
 **nothing may grow without a limit.** Every buffer, queue and input size has a
-hard maximum, and an attacker can't make the server use unbounded memory:
+hard maximum, so no single message, request or connection can take more than
+its share. The last two rows are the gaps that remain: until step 5 adds
+per-user limits, someone who opens enough connections can still make the
+server run out of memory.
 
 | Limit | Value | Where |
 |-------|-------|-------|
@@ -102,6 +107,8 @@ hard maximum, and an attacker can't make the server use unbounded memory:
 | Database connections | pool maximum | `pool_max_conns` in `DATABASE_URL` |
 | In-memory history per room | 500 | `NewMemoryStore(500)`, `cmd/server/main.go` |
 | Shutdown (requests and chat goodbyes) | 10 s | `shutdownTimeout`, `cmd/server/main.go` |
+| Connections, per user and in total | **none yet** (step 5) | `Handler.ServeHTTP`, `internal/chat/handler.go` |
+| Accounts and rooms without PostgreSQL | **none**: every one stays in memory | `MemoryUserStore`, `MemoryStore` (production uses `DATABASE_URL`) |
 
 A new limit goes in this table.
 
@@ -195,9 +202,12 @@ and the same code runs everywhere.
 
 **In Go:** there is no pointer arithmetic, and the garbage collector prevents
 dangling pointers, so most of the danger is gone. We avoid pointer-to-pointer
-types and use function values only where Go's standard library expects them
-(HTTP handlers, `time.AfterFunc`, test helpers). Every call through a function
-value is a call the recursion checker can't see, so keep them rare.
+types. Function values are used for HTTP handlers and other callbacks, and to
+pass in what a test needs to replace: `run` takes `getenv` instead of reading
+the environment itself, the hub and the token code use a replaceable clock,
+and `serve` takes the `drain` function it calls at shutdown. Every call
+through a function value is a call the recursion checker can't see, so keep
+them few and simple, and check them in review for calls that loop back.
 
 ## Rule 10: zero warnings, analyzed daily
 
@@ -207,10 +217,14 @@ value is a call the recursion checker can't see, so keep them rare.
 > source code analyzer and should pass the analyses with zero warnings.
 
 **In Go:** CI fails on any finding from `go vet`, `golangci-lint` (about 50
-linters, including `staticcheck` and `gosec`), `jplcheck`, ShellCheck,
-`govulncheck` and CodeQL. There is no "warning" level that can be ignored. A
-scheduled run every day repeats the analysis and the vulnerability scan, and
-runs the fuzz tests; CodeQL also runs weekly.
+linters, including `staticcheck` and `gosec`), `jplcheck`, ShellCheck and
+`govulncheck`. There is no "warning" level that can be ignored. CodeQL works
+differently: all its results go to the repository's Security tab, but by
+default its pull request check fails only when the change adds an alert of
+severity "error" or a security alert rated high or critical. (The code
+scanning settings can make it stricter.) A scheduled run every day repeats
+the analysis and the vulnerability scan, and runs the fuzz tests; CodeQL also
+runs weekly.
 
 If a linter is wrong about a specific line, silence it on that line only, with
 a reason:

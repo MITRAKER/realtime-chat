@@ -38,31 +38,31 @@ linters:
     - bidichk # no invisible Unicode direction tricks in source
     - gosec # common security mistakes
     # --- Size and complexity (JPL rule 4: small functions) ---
-    - funlen
-    - gocognit
-    - gocyclo
-    - nakedret
-    - nestif
+    - funlen # functions over 60 lines or 40 statements
+    - gocognit # functions that are hard to follow (settings below)
+    - gocyclo # functions with too many paths through them
+    - nakedret # no bare return in functions with named results
+    - nestif # no deeply nested if statements
     # --- Style and clarity ---
-    - asciicheck
-    - canonicalheader
-    - containedctx
-    - dupword
-    - errname
-    - gocheckcompilerdirectives
-    - gochecknoinits
-    - gocritic
-    - intrange
-    - misspell
+    - asciicheck # names use only ASCII, so no letter from another script hides in one
+    - canonicalheader # HTTP header names are written canonically (Content-Type)
+    - containedctx # no context.Context stored in a struct; pass it instead
+    - dupword # no repeated words such as "the the" in comments and strings
+    - errname # error types end in Error, error variables start with Err
+    - gocheckcompilerdirectives # //go: directives are valid, not silently ignored
+    - gochecknoinits # no init functions: setup happens where you can see it
+    - gocritic # many small bug, style and performance checks
+    - intrange # `for i := range n` where it fits (Go 1.22+)
+    - misspell # commonly misspelled English words
     - nolintlint # every //nolint names one linter and says why
-    - predeclared
-    - recvcheck
+    - predeclared # no variables named like built-ins (len, new, error)
+    - recvcheck # a type's methods don't mix pointer and value receivers
     - revive # exported names have doc comments, and more
-    - sloglint
-    - thelper
-    - unconvert
-    - unparam
-    - usestdlibvars
+    - sloglint # log/slog calls all use one style (settings below)
+    - thelper # test helpers call t.Helper(), so failures point at the caller
+    - unconvert # no needless type conversions
+    - unparam # no parameters or results that are unused or always the same
+    - usestdlibvars # standard constants (http.MethodGet), not "GET"
 
   settings:
     errcheck:

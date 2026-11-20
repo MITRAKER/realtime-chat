@@ -27,6 +27,6 @@ is published and you're credited, unless you'd rather not be.
 - Dependabot proposes dependency updates every week.
 - The `gitleaks` pre-commit hook stops secrets before they are committed.
   GitHub's secret scanning, free for public repositories, should stay on in
-  the repository settings (Settings, Code security).
+  the repository settings (Settings, Advanced Security).
 - Release images run as a non-root user on a minimal base image, and come
   with an SBOM (a list of everything inside) and build provenance.

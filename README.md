@@ -119,7 +119,7 @@ Database tests are skipped unless `TEST_DATABASE_URL` is set. With
 TEST_DATABASE_URL='postgres://chat:chat@localhost:5432/chat_test?sslmode=disable' go test -race ./...
 ```
 
-The Makefile has a task for every check CI runs (`make help` lists them all):
+The Makefile has a task for each of CI's main checks (`make help` lists them all):
 
 ```sh
 make check     # tidy modules, go vet, golangci-lint, NASA/JPL rules, tests

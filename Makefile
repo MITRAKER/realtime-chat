@@ -45,7 +45,7 @@ vuln: ## Scan for known vulnerabilities in the code and its dependencies
 tidy: ## Check that go.mod and go.sum are tidy
 	go mod tidy -diff
 
-check: tidy vet lint jpl test ## Run everything CI runs (do this before pushing)
+check: tidy vet lint jpl test ## Run CI's main checks (do this before pushing)
 
 fuzz: ## Run each fuzz test for 30 seconds (or FUZZTIME=5m)
 	./scripts/fuzz.sh $(FUZZTIME)

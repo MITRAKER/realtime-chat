@@ -8,10 +8,11 @@ Before version 1.0.0, a minor version (0.**x**.0) may change how things work.
 
 ## [Unreleased]
 
-Nothing has been released yet. Each step of the project becomes a version
-when its pull request is merged and tagged (see "Releases" in
-[CONTRIBUTING.md](CONTRIBUTING.md)): step 1 is v0.1.0, step 2 is v0.2.0 and
-step 3 is v0.3.0.
+Nothing has been released yet. Step 3 adds the release workflow, so it will
+be the first release, v0.3.0, once its pull request is merged and tagged (see
+"Releases" in [CONTRIBUTING.md](CONTRIBUTING.md)). Steps 1 and 2 came before
+that workflow existed: tagging them v0.1.0 and v0.2.0 would only mark them in
+the history, with no release notes, binaries or image.
 
 ### Step 3 (v0.3.0): a professional repository
 
@@ -21,8 +22,8 @@ step 3 is v0.3.0.
   golangci-lint with about 50 linters, the NASA/JPL rule checker, ShellCheck,
   tests with the race detector and a real PostgreSQL on the two supported Go
   releases, a coverage minimum of 80%, `govulncheck`, builds for five
-  platforms and the Docker image. One "CI OK" check sums it all up for branch
-  protection.
+  platforms and the Docker image, and a check of the release configuration.
+  One "CI OK" check sums it all up for branch protection.
 - A daily scheduled run of static analysis, the vulnerability scan and the
   fuzz tests, so new problems are found even when nobody pushes.
 - `jplcheck`, a custom static analyzer for NASA/JPL "Power of Ten" rules 1

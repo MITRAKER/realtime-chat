@@ -835,7 +835,7 @@ someone published or `run:`s a command. `needs:` makes one job wait for others.
 | Lint and static analysis | `go.mod` is tidy, `go vet` and about 50 linters find nothing, the JPL rules hold, the shell scripts are clean |
 | Test (twice) | every test passes with the race detector against a real PostgreSQL, on both supported Go versions, with at least 80% coverage |
 | Known vulnerabilities | no vulnerable function in our dependencies or the standard library is reachable from our code |
-| Build | the server compiles for Linux, macOS and Windows, and the Docker image builds |
+| Build | the server compiles for Linux, macOS and Windows, the release configuration is valid, and the Docker image builds |
 | Fuzz tests | (daily only) a minute of fuzzing per target finds nothing |
 | CI OK | every job above passed |
 
@@ -845,12 +845,26 @@ A few details are worth copying into every project:
   receives can read the code and do nothing else. Actions are code written by
   other people, and they do get compromised: in March 2025 the popular
   `tj-actions/changed-files` action was altered to print the secrets of the
-  workflows that used it into their build logs. A read-only token limits the damage. Only the release
-  workflow may write (to create the release and push the image).
+  workflows that used it into their build logs. A read-only token limits the
+  damage. Workflows that must write get only the permission they need: the
+  release jobs to publish the release (`contents: write`) and the image
+  (`packages: write`), CodeQL to upload its results (`security-events: write`)
+  and dependency review to comment on the pull request (`pull-requests: write`).
 - **Pinned versions.** `golangci-lint` is pinned to an exact version, so a new
   release with new checks can't turn the build red overnight. Upgrading is a
-  deliberate change, proposed by Dependabot. The strictest teams pin actions
-  to a full commit hash instead of a tag like `v6`, since a tag can be moved.
+  deliberate change made by hand: the version is written in `ci.yml` and in
+  the `Makefile`, and both change together (the same goes for `govulncheck`).
+  Dependabot can't do it for you: it updates `go.mod` and the `uses:` lines of
+  workflows, not a version given to an action as an input. The strictest teams
+  pin actions to a full commit hash instead of a tag like `v6`, since a tag
+  can be moved.
+- **No caches in releases.** CI caches downloaded modules and compiled packages
+  between runs to save time. A run for a version tag can restore a cache that
+  a run on `main` saved, and runs on `main` execute third-party tools. If one
+  of those tools were compromised, it could plant compiled code in the cache,
+  and the next release would ship it. So the release workflow builds from
+  scratch (`cache: false`): slower, but it contains only what the tagged
+  commit says.
 - **One summary check.** Branch protection asks you to name the checks that
   must pass. Naming every job means editing the settings whenever a job is
   renamed, and the fuzz job is *skipped* on pull requests. So the last job,
@@ -860,8 +874,11 @@ A few details are worth copying into every project:
   supports. CI tests on `oldstable` and `stable`, the two releases the Go team
   still patches, so that promise is checked rather than hoped. Releases are
   built with the newest Go, so they carry the latest standard-library fixes.
-- **Cancel stale runs.** `concurrency` with `cancel-in-progress` stops the run
-  for an older push when a newer one arrives.
+- **Cancel stale runs, on pull requests only.** `concurrency` with
+  `cancel-in-progress` stops a pull request's run when a newer push to the
+  same pull request arrives. Every other run gets a group of its own
+  (`github.run_id`), so a run on `main`, like the daily one that fuzzes, is
+  never cancelled halfway.
 
 ### 3.2 Linters: reading code for bugs without running it
 
@@ -870,8 +887,8 @@ the first static analyzer; `go vet` is the second. **golangci-lint** runs about
 50 more in one pass. Each one is switched on in `.golangci.yml` with a comment
 saying what it catches.
 
-Switched on for the first time, they reported 93 findings in the code of steps
-1 and 2. Some examples, from then and from this step's new code:
+Run on the code of steps 1 and 2, they report 83 findings. Some examples, from
+that code and from this step's new code:
 
 | Linter | What it found | Why it matters |
 |---|---|---|
@@ -958,8 +975,9 @@ The first version had no `queued`, and a review caught what that cost. A slow
 client was added again by every announcement it missed while it waited its
 turn: with n slow clients sharing r rooms, about r × n² / 2 entries. The loop
 still ended, because removed clients are skipped, but memory wasn't bounded
-(rule 3). Measured with 500 slow clients in 100 shared rooms, one removal took
-1.3 GB of memory and 5.8 seconds; with `queued` it takes 5 MB and 0.7 seconds.
+(rule 3). Measured with 500 slow clients in 100 shared rooms, one removal made
+the heap grow by up to 1.3 GB and took 3 to 7 seconds; with `queued`, the heap
+grows by 5 MB and it takes 0.7 seconds.
 Those 0.7 seconds are still the hub doing nothing else, because each departure
 is announced to everyone left in every room. Limits on connections per user
 (step 5) are what stop someone from setting that up.
@@ -983,8 +1001,12 @@ and fails the test if the marker never comes.
 **Rule 3: no unbounded memory.** The original rule bans allocating memory after
 start-up. Go needs its garbage collector, so we keep the spirit: nothing may
 grow without a limit. Every buffer, queue and input size has a maximum, listed
-in the coding standards. An attacker can make the server busy, but not make it
-run out of memory.
+in the coding standards, so no single message, request or connection can take
+more than its share. Two things have no limit yet: how many connections
+someone can open, and, when the server runs without PostgreSQL, how many
+accounts and rooms it keeps in memory. Until step 5 adds per-user limits,
+enough connections can still run the server out of memory, and the coding
+standards list that as a known gap.
 
 **Rule 4: functions fit on a page.** `funlen` allows 60 lines and 40
 statements. For example, `Migrate` became three small functions
@@ -1260,39 +1282,51 @@ modules in `go.mod`. A professional repository watches that code too.
 - **Dependabot** opens a pull request every week when a Go module, a GitHub
   Action or the Docker base image has a new version. CI tests each one.
 - **Dependency review** fails a pull request that adds a dependency with a
-  known vulnerability of moderate severity or worse.
+  known vulnerability of moderate severity or worse. It reads GitHub's
+  dependency graph, a repository setting the owner has to switch on.
 - **CodeQL**, GitHub's code scanner, turns the code into a database and runs
   queries on it, such as "can data from an HTTP request reach a SQL query
   without passing through a parameter?" (this is called **taint tracking**).
-  Results appear in the repository's Security tab.
+  Results appear in the repository's Security tab. By default the pull request
+  check fails only when the change adds a serious alert: severity "error", or
+  a security alert rated high or critical.
 - **Secrets**: `.env` is ignored by git, the `gitleaks` pre-commit hook blocks
   commits that contain keys or tokens, and GitHub's secret scanning catches
   anything that slips through.
 - **SBOM and provenance**: each release image ships with a Software Bill of
-  Materials (a list of every package inside it) and a signed provenance
-  statement (which workflow built it, from which commit). When the next big
+  Materials (a list of every package inside it) and a provenance statement
+  (which workflow built it, from which commit). When the next big
   vulnerability in a popular library is announced, an SBOM answers "are we
-  affected?" in seconds.
+  affected?" in seconds. Both are attached to the image unsigned: they record
+  how it was made, but can't prove who wrote them. Signing them, for example
+  with GitHub's artifact attestations (`actions/attest-build-provenance`), is
+  the next step up.
 
 ### 3.8 Containers and releases
 
 The `Dockerfile` has two stages:
 
 ```dockerfile
-FROM golang:1.27-alpine AS build          # stage 1: has the Go toolchain
+# Stage 1 has the Go toolchain.
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download                       # cached until go.mod changes
+# This layer is cached until go.mod or go.sum changes.
+RUN go mod download
 COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/realtime-chat ./cmd/server
 
-FROM gcr.io/distroless/static-debian12:nonroot   # stage 2: what ships
+# Stage 2 is what ships.
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/realtime-chat /realtime-chat
 USER nonroot:nonroot
 ENTRYPOINT ["/realtime-chat"]
 ```
+
+(A `#` starts a comment only at the beginning of a line. Put one after an
+instruction and Docker reads it as more arguments.)
 
 Only the second stage ships: no compiler, no shell, no package manager, just
 our binary and a few files. The image is about 22 MB, and an attacker who
@@ -1318,8 +1352,8 @@ companion, in the Keep a Changelog format.
 
 ### 3.9 Everything else a good repository has
 
-- **Makefile**: one short command per task, the same ones CI runs. `make help`
-  lists them.
+- **Makefile**: one short command per task, running the same tools with the
+  same settings as CI. `make help` lists them.
 - **pre-commit hooks**: `make hooks` installs checks that run on every commit
   (formatting, secrets, linters on what changed) and on every push (the tests).
 - **.editorconfig**: tells every editor to use tabs in Go, spaces in YAML, and
@@ -1333,11 +1367,14 @@ companion, in the Keep a Changelog format.
   A badge is a claim; CI is what makes it true.
 
 Some protections are repository settings, which only the owner can change.
-Recommended for `main`: require a pull request, require the "CI OK", CodeQL and
-dependency review checks to pass, require branches to be up to date before
-merging, and block force pushes. Also turn on secret scanning with push
-protection, private vulnerability reporting, and "automatically delete head
-branches".
+Recommended for `main`: require a pull request, require the "CI OK", "CodeQL"
+and "Dependency review" checks to pass, require branches to be up to date
+before merging, and block force pushes. Under Settings, Advanced Security,
+turn on the dependency graph (dependency review can't run without it), secret
+scanning with push protection, and private vulnerability reporting (the
+"Report a vulnerability" link in `SECURITY.md` needs it). Code scanning's
+settings there can also make the CodeQL check stricter than its default.
+Under General, turn on "automatically delete head branches".
 
 ### 3.10 Try it yourself
 
@@ -1358,7 +1395,9 @@ branches".
    Then put it back.
 4. Bring the bcrypt bug back: in `Login` (`internal/auth/service.go`), remove
    `|| !hashable(password)` and run `go test ./internal/auth`. The saved input
-   in `testdata/fuzz/FuzzLogin/` fails at once. Now move that file away and run
+   in `testdata/fuzz/FuzzLogin/` fails at once, and so does the hand-written
+   seed `f.Add("password", "\x00password")` in `fuzz_test.go`. Move that file
+   away, comment out that seed, and run
    `go test -run '^$' -fuzz '^FuzzLogin$' ./internal/auth`. How long does the
    fuzzer take to find the bug on its own? Restore everything afterwards.
 5. **Exercise:** write `FuzzBearerToken` for `auth.BearerToken`. Two properties
@@ -1376,7 +1415,9 @@ branches".
 9. Remove `queued` from `removeClient` (keep the `append`) and run
    `go test ./internal/chat`. Do the tests notice? Write a benchmark with 300
    slow clients that share 50 rooms, run it with `go test -bench . -benchmem`
-   with and without `queued`, and compare.
+   with and without `queued`, and compare. (`-benchmem` counts everything
+   allocated during a run, not the most in use at once, so expect bigger
+   numbers than the heap growth in section 3.3.)
 10. **Exercise:** allow Unicode room names safely. Normalize names to NFC
     (`golang.org/x/text/unicode/norm`), refuse names that mix scripts, and
     refuse a new room whose UTS #39 skeleton matches an existing room's. Which
