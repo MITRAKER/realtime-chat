@@ -1,7 +1,11 @@
 name: Dependency review
 
-# On every pull request, check whether it adds or upgrades a dependency
-# with a known vulnerability or an incompatible license, and fail if so.
+# On every pull request, check whether it adds or upgrades a dependency with
+# a known vulnerability of moderate severity or worse, and fail if so.
+#
+# It reads the repository's dependency graph, which the owner must switch on
+# (Settings, Advanced Security, Dependency graph). Until then this check fails
+# with "Dependency review is not supported on this repository".
 on:
   pull_request:
 
@@ -11,6 +15,7 @@ permissions:
 
 jobs:
   review:
+    name: Dependency review
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -50,11 +50,10 @@ changelog:
     - title: Other changes
       order: 999
   filters:
+    # Leave out commits users don't need to read about, with or without a
+    # scope: "docs: ...", "ci(deps): ..." (Dependabot), "test(chat)!: ...".
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^ci:"
-      - "^chore:"
+      - '^(docs|test|ci|chore)(\(.+\))?!?:'
 
 release:
   footer: |

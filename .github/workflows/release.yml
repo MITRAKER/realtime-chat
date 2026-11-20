@@ -41,6 +41,7 @@ jobs:
         with:
           go-version: stable
           check-latest: true
+          cache: false # see the binaries job
       - run: go test -race -count=1 ./...
 
   binaries:
@@ -57,6 +58,11 @@ jobs:
         with:
           go-version: stable
           check-latest: true
+          # No cache: a tag's run can restore caches that CI runs on main
+          # saved, and those runs execute third-party tools. A release is
+          # built from scratch, so nothing an earlier run left behind can
+          # end up in the published binaries.
+          cache: false
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -97,7 +103,8 @@ jobs:
           build-args: VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Supply-chain records: what's inside the image (SBOM) and how
-          # it was built (provenance), signed by GitHub.
+          # Supply-chain records attached to the image: what's inside it
+          # (SBOM) and how it was built (provenance). BuildKit attaches
+          # them unsigned.
           sbom: true
           provenance: mode=max

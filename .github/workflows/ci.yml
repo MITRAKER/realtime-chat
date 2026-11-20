@@ -15,9 +15,12 @@ on:
 permissions:
   contents: read
 
-# A new push to the same branch cancels the older, now pointless run.
+# A new push to a pull request cancels that pull request's older, now
+# pointless run. Every other run (a push to main, the daily schedule, a
+# manual run) gets a group of its own and is never cancelled, so every
+# merged commit gets a full result and the daily fuzzing always finishes.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -112,6 +115,14 @@ jobs:
             echo "building $target"
             GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/server
           done
+      # The release workflow only runs when a version tag is pushed, so check
+      # its GoReleaser configuration here, on every change.
+      - name: Release configuration is valid
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
       - uses: docker/setup-buildx-action@v4
       - name: Docker image builds
         uses: docker/build-push-action@v7

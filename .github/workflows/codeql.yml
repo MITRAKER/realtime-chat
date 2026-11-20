@@ -13,8 +13,9 @@ on:
 permissions:
   contents: read
 
+# As in ci.yml: only a newer push to the same pull request cancels a run.
 concurrency:
-  group: codeql-${{ github.ref }}
+  group: codeql-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
