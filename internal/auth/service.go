@@ -97,10 +97,11 @@ func (s *Service) Register(ctx context.Context, username, password string) (Sess
 
 // Login checks a username and password and returns a new session.
 func (s *Service) Login(ctx context.Context, username, password string) (Session, error) {
-	// A name that could never have been registered can't be right. Check
-	// it before touching the database: odd input such as a NUL character
-	// would otherwise make PostgreSQL return an error (and a 500).
-	if ValidateUsername(username) != nil {
+	// A name that could never have been registered can't be right, and
+	// neither can a password bcrypt can't tell apart from others (see
+	// hashable). Check before touching the database: odd input such as a
+	// NUL character would otherwise make PostgreSQL return an error (a 500).
+	if ValidateUsername(username) != nil || !hashable(password) {
 		return Session{}, s.failLogin(ctx, password)
 	}
 	user, hash, err := s.users.UserByUsername(ctx, username)

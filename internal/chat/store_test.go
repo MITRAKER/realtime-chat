@@ -12,7 +12,7 @@ import (
 )
 
 func TestMemoryStoreContract(t *testing.T) {
-	storetest.Run(t, func(t *testing.T) (chat.Store, func(string) auth.User) {
+	storetest.Run(t, func(*testing.T) (chat.Store, func(string) auth.User) {
 		var id int64
 		return chat.NewMemoryStore(500), func(name string) auth.User {
 			id++

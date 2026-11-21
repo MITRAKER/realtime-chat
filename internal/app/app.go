@@ -2,6 +2,7 @@
 package app
 
 import (
+	"io"
 	"io/fs"
 	"net/http"
 	"time"
@@ -34,8 +35,8 @@ func Routes(d Deps) http.Handler {
 	mux := http.NewServeMux()
 	d.Auth.Routes(mux)
 	mux.Handle("GET /ws", chat.NewHandler(d.Hub, d.Messages, d.Tokens))
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeOK(w)
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if d.Ready != nil {
@@ -44,10 +45,16 @@ func Routes(d Deps) http.Handler {
 				return
 			}
 		}
-		w.Write([]byte("ok"))
+		writeOK(w)
 	})
 	mux.Handle("GET /", http.FileServerFS(d.Static))
 	return mux
+}
+
+// writeOK answers "ok". The write can only fail if the client has already
+// hung up, and then there is nobody left to tell, so the error is dropped.
+func writeOK(w http.ResponseWriter) {
+	_, _ = io.WriteString(w, "ok")
 }
 
 // Timeouts protect the server from clients that connect and then go quiet

@@ -1,0 +1,113 @@
+name: Release
+
+# Pushing a version tag such as v0.3.0 tests the code, builds binaries for
+# every platform, publishes a GitHub release with notes and checksums, and
+# pushes a multi-platform Docker image to the GitHub Container Registry.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+# Never run two releases at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test before releasing
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chat
+          POSTGRES_PASSWORD: chat
+          POSTGRES_DB: chat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chat -d chat_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgres://chat:chat@localhost:5432/chat_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false # see the binaries job
+      - run: go test -race -count=1 ./...
+
+  binaries:
+    name: GitHub release (GoReleaser)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # GoReleaser builds the release notes from git history
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          # No cache: a tag's run can restore caches that CI runs on main
+          # saved, and those runs execute third-party tools. A release is
+          # built from scratch, so nothing an earlier run left behind can
+          # end up in the published binaries.
+          cache: false
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.20.3 # what CI rehearses with; upgrade both together
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  image:
+    name: Docker image (ghcr.io)
+    # After the GitHub release: if that fails, no image is published either.
+    needs: [test, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # to push to ghcr.io
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false # no caches in a release (see the binaries job)
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # The same version string the binaries report, such as 0.3.0.
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Supply-chain records attached to the image: what's inside it
+          # (SBOM) and how it was built (provenance). BuildKit attaches
+          # them unsigned.
+          sbom: true
+          provenance: mode=max

@@ -54,7 +54,7 @@ func TestDefaultTimeoutsAreAllSet(t *testing.T) {
 func TestServerTimeoutsDoNotCutWebSockets(t *testing.T) {
 	const short = 200 * time.Millisecond
 	srv := startWithTimeouts(t, allTimeouts(short))
-	alice, _ := connect(t, srv, signUp(t, srv, "alice"), "general")
+	alice, _ := connect(t, srv, signUp(t, srv, "alice"))
 
 	time.Sleep(5 * short) // well past every server timeout
 
@@ -105,7 +105,8 @@ func TestIdleConnectionIsClosed(t *testing.T) {
 
 func dialTCP(t *testing.T, srv *httptest.Server) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	var d net.Dialer
+	conn, err := d.DialContext(t.Context(), "tcp", srv.Listener.Addr().String())
 	must(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn

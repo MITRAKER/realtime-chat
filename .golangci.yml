@@ -1,0 +1,131 @@
+# golangci-lint runs many Go linters in one pass. CI runs it on every pull
+# request with the exact version pinned in .github/workflows/ci.yml, and
+# `make lint` runs the same thing locally.
+#
+# The rule is "zero warnings" (NASA/JPL rule 10): every finding is fixed,
+# or silenced on its line with //nolint:<linter> // <why>, so nobody ever
+# learns to ignore the output. docs/CODING_STANDARDS.md explains the rules.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true # test code is code: it gets the same checks
+
+linters:
+  # "standard" turns on errcheck, govet, ineffassign, staticcheck and unused.
+  default: standard
+  enable:
+    # --- Bugs ---
+    - bodyclose # HTTP response bodies are closed
+    - copyloopvar # no needless loop variable copies (Go 1.22+)
+    - durationcheck # no multiplying two durations by mistake
+    - errchkjson # JSON encoding errors are not dropped
+    - errorlint # errors are compared with errors.Is/As, so wrapping works
+    - exhaustive # a switch over an enum handles every value (JPL rule 5)
+    - fatcontext # no contexts growing inside loops
+    - forcetypeassert # x.(T) always checks ok
+    - makezero # no append to a slice that was made with a length
+    - musttag # structs passed to json.Marshal have json tags
+    - nilerr # no returning nil when err != nil
+    - nilnesserr # no returning a different, nil error
+    - nilnil # no returning (nil, nil) from a function that also returns a value
+    - noctx # HTTP requests and dials carry a context, so they can be cancelled
+    - reassign # no changing other packages' variables
+    - rowserrcheck # rows.Err() is checked after a query loop
+    - sqlclosecheck # SQL rows and statements are closed
+    - wastedassign # no values that are assigned and never used
+    # --- Security ---
+    - bidichk # no invisible Unicode direction tricks in source
+    - gosec # common security mistakes
+    # --- Size and complexity (JPL rule 4: small functions) ---
+    - funlen # functions over 60 lines or 40 statements
+    - gocognit # functions that are hard to follow (settings below)
+    - gocyclo # functions with too many paths through them
+    - nakedret # no bare return in functions with named results
+    - nestif # no deeply nested if statements
+    # --- Style and clarity ---
+    - asciicheck # names use only ASCII, so no letter from another script hides in one
+    - canonicalheader # HTTP header names are written canonically (Content-Type)
+    - containedctx # no context.Context stored in a struct; pass it instead
+    - dupword # no repeated words such as "the the" in comments and strings
+    - errname # error types end in Error, error variables start with Err
+    - gocheckcompilerdirectives # //go: directives are valid, not silently ignored
+    - gochecknoinits # no init functions: setup happens where you can see it
+    - gocritic # many small bug, style and performance checks
+    - intrange # `for i := range n` where it fits (Go 1.22+)
+    - misspell # commonly misspelled English words
+    - nolintlint # every //nolint names one linter and says why
+    - predeclared # no variables named like built-ins (len, new, error)
+    - recvcheck # a type's methods don't mix pointer and value receivers
+    - revive # exported names have doc comments, and more
+    - sloglint # log/slog calls all use one style (settings below)
+    - thelper # test helpers call t.Helper(), so failures point at the caller
+    - unconvert # no needless type conversions
+    - unparam # no parameters or results that are unused or always the same
+    - usestdlibvars # standard constants (http.MethodGet), not "GET"
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # `_ = f()` is allowed: it is the visible, deliberate "ignore this
+      # error" that JPL rule 7 asks for, and it needs a comment saying why.
+      check-blank: false
+    funlen:
+      lines: 60 # JPL rule 4: a function fits on one printed page
+      statements: 40
+      ignore-comments: true
+    gocognit:
+      min-complexity: 15
+    gocyclo:
+      min-complexity: 12
+    nestif:
+      min-complexity: 4
+    nakedret:
+      max-func-lines: 0
+    govet:
+      enable-all: true # includes "shadow": no variable hiding another
+      disable:
+        - fieldalignment # saves a few bytes per struct; costs readability
+    gocritic:
+      enabled-tags: [diagnostic, performance, style]
+      disabled-checks:
+        # These two suggest passing structs over ~80 bytes by pointer. Our
+        # messages (about 140 bytes) travel by value on purpose: a copy
+        # can't be changed by another goroutine, and copying 140 bytes
+        # costs nanoseconds.
+        - hugeParam
+        - rangeValCopy
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    sloglint:
+      kv-only: true # slog.Info("msg", "key", value), never mixed styles
+      context: ""
+    exhaustive:
+      default-signifies-exhaustive: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - common-false-positives
+    rules:
+      # The contract checks in authtest and storetest are test bodies that
+      # run as subtests, not helpers. Marking them as helpers would make
+      # a failure point at the shared t.Run line instead of the check.
+      - path: internal/(auth/authtest|chat/storetest)/
+        linters: [thelper]
+        text: "should start from t.Helper"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/MITRAKER/realtime-chat
+
+issues:
+  # Show every finding, not just the first few of each kind.
+  max-issues-per-linter: 0
+  max-same-issues: 0

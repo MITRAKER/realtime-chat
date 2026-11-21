@@ -3,6 +3,8 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -54,35 +56,50 @@ func startServer(t *testing.T, users auth.UserStore, messages chat.Store) *httpt
 	return srv
 }
 
-func signUp(t *testing.T, srv *httptest.Server, name string) string {
+// request makes an HTTP request and returns the status code and body. It
+// reads and closes the body itself, so no test can forget to.
+func request(t *testing.T, method, url, body string) (status int, data []byte) {
 	t.Helper()
-	body := `{"username":"` + name + `","password":"a good long password"}`
-	res, err := http.Post(srv.URL+"/api/register", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	var session auth.Session
-	if err := json.NewDecoder(res.Body).Decode(&session); err != nil || res.StatusCode != http.StatusCreated {
-		t.Fatalf("register %s: status %d, %v", name, res.StatusCode, err)
-	}
-	return session.Token
+	req, err := http.NewRequestWithContext(t.Context(), method, url, strings.NewReader(body))
+	must(t, err)
+	res, err := http.DefaultClient.Do(req)
+	must(t, err)
+	data, err = io.ReadAll(res.Body)
+	must(t, errors.Join(err, res.Body.Close()))
+	return res.StatusCode, data
 }
 
-// connect opens the chat socket, logs in, and joins a room. It returns the
-// connection and the history the server sent on joining.
-func connect(t *testing.T, srv *httptest.Server, token, room string) (*websocket.Conn, chat.Outbound) {
+// session posts a username and password to an account endpoint and
+// returns the login token.
+func session(t *testing.T, url, name string, wantStatus int) string {
+	t.Helper()
+	body := `{"username":"` + name + `","password":"a good long password"}`
+	status, data := request(t, http.MethodPost, url, body)
+	var s auth.Session
+	if err := json.Unmarshal(data, &s); err != nil || status != wantStatus {
+		t.Fatalf("POST %s as %s: status %d, %v", url, name, status, err)
+	}
+	return s.Token
+}
+
+func signUp(t *testing.T, srv *httptest.Server, name string) string {
+	t.Helper()
+	return session(t, srv.URL+"/api/register", name, http.StatusCreated)
+}
+
+// connect opens the chat socket, logs in, and joins "general". It returns
+// the connection and the history the server sent on joining.
+func connect(t *testing.T, srv *httptest.Server, token string) (*websocket.Conn, chat.Outbound) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	//nolint:bodyclose // coder/websocket: "You never need to close resp.Body yourself."
 	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.CloseNow() })
+	must(t, err)
+	t.Cleanup(func() { _ = conn.CloseNow() })
 	must(t, wsjson.Write(ctx, conn, chat.Inbound{Type: chat.TypeAuth, Token: token}))
 	readType(t, conn, chat.TypeReady)
-	must(t, wsjson.Write(ctx, conn, chat.Inbound{Type: chat.TypeJoin, Room: room}))
+	must(t, wsjson.Write(ctx, conn, chat.Inbound{Type: chat.TypeJoin, Room: "general"}))
 	return conn, readType(t, conn, chat.TypeHistory)
 }
 
@@ -90,6 +107,8 @@ func readType(t *testing.T, conn *websocket.Conn, typ string) chat.Outbound {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// jpl:loop returns when a frame of the wanted type arrives; a read
+	// error (including the 5 s timeout) fails the test.
 	for {
 		var m chat.Outbound
 		must(t, wsjson.Read(ctx, conn, &m))
@@ -108,8 +127,9 @@ func must(t *testing.T, err error) {
 
 // chatFlow is the whole journey: sign up, connect, chat, and see history.
 func chatFlow(t *testing.T, srv *httptest.Server) {
-	alice, _ := connect(t, srv, signUp(t, srv, "alice"), "general")
-	bob, _ := connect(t, srv, signUp(t, srv, "bob"), "general")
+	t.Helper()
+	alice, _ := connect(t, srv, signUp(t, srv, "alice"))
+	bob, _ := connect(t, srv, signUp(t, srv, "bob"))
 
 	ctx := context.Background()
 	must(t, wsjson.Write(ctx, alice, chat.Inbound{Type: chat.TypeSend, Room: "general", Text: "hello bob"}))
@@ -123,11 +143,8 @@ func TestEndToEndInMemory(t *testing.T) {
 	srv := startServer(t, auth.NewMemoryUserStore(), chat.NewMemoryStore(100))
 	chatFlow(t, srv)
 
-	res, err := http.Get(srv.URL + "/healthz")
-	must(t, err)
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("healthz = %d", res.StatusCode)
+	if status, _ := request(t, http.MethodGet, srv.URL+"/healthz", ""); status != http.StatusOK {
+		t.Fatalf("healthz = %d", status)
 	}
 }
 
@@ -141,16 +158,8 @@ func TestEndToEndPostgresSurvivesRestart(t *testing.T) {
 
 	// A brand-new server process: new hub, empty memory, same database.
 	second := startServer(t, postgres.NewUserStore(pool), postgres.NewMessageStore(pool))
-	res, err := http.Post(second.URL+"/api/login", "application/json",
-		strings.NewReader(`{"username":"ALICE","password":"a good long password"}`))
-	must(t, err)
-	var session auth.Session
-	must(t, json.NewDecoder(res.Body).Decode(&session))
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("login after restart: %d", res.StatusCode)
-	}
-	_, history := connect(t, second, session.Token, "general")
+	token := session(t, second.URL+"/api/login", "ALICE", http.StatusOK)
+	_, history := connect(t, second, token)
 	if len(history.Messages) != 1 || history.Messages[0].Text != "hello bob" || history.Messages[0].User != "alice" {
 		t.Fatalf("history after restart = %+v", history.Messages)
 	}

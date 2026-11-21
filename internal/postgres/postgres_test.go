@@ -24,12 +24,14 @@ import (
 
 func TestUserStoreContract(t *testing.T) {
 	authtest.Run(t, func(t *testing.T) auth.UserStore {
+		t.Helper()
 		return postgres.NewUserStore(postgrestest.NewPool(t))
 	})
 }
 
 func TestMessageStoreContract(t *testing.T) {
 	storetest.Run(t, func(t *testing.T) (chat.Store, func(string) auth.User) {
+		t.Helper()
 		pool := postgrestest.NewPool(t)
 		users := postgres.NewUserStore(pool)
 		return postgres.NewMessageStore(pool), func(name string) auth.User {
@@ -44,21 +46,14 @@ func TestMessageStoreContract(t *testing.T) {
 
 func TestMigrateIsIdempotentAndSafeInParallel(t *testing.T) {
 	pool := postgrestest.NewPool(t) // already migrated once
+	errs := make([]error, 5)
 	var wg sync.WaitGroup
-	errs := make(chan error, 5)
-	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs <- postgres.Migrate(context.Background(), pool)
-		}()
+	for i := range errs {
+		wg.Go(func() { errs[i] = postgres.Migrate(context.Background(), pool) })
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
 	}
 	var n int
 	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM schema_migrations").Scan(&n); err != nil {
@@ -92,7 +87,7 @@ func TestSQLInjectionIsJustText(t *testing.T) {
 		t.Fatalf("got %+v, %v", u, err)
 	}
 	store := postgres.NewMessageStore(pool)
-	if _, err := store.SaveMessage(ctx, evil, u, evil); err != nil {
+	if _, err = store.SaveMessage(ctx, evil, u, evil); err != nil {
 		t.Fatal(err)
 	}
 	msgs, _, err := store.History(ctx, evil, 0, 10)
@@ -115,7 +110,7 @@ func TestHistoryUsesTheIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "ANALYZE messages"); err != nil {
+	if _, err = pool.Exec(ctx, "ANALYZE messages"); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := pool.Query(ctx, `EXPLAIN

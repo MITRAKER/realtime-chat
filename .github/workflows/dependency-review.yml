@@ -1,0 +1,25 @@
+name: Dependency review
+
+# On every pull request, check whether it adds or upgrades a dependency with
+# a known vulnerability of moderate severity or worse, and fail if so.
+#
+# It reads the repository's dependency graph, which the owner must switch on
+# (Settings, Advanced Security, Dependency graph). Until then GitHub refuses
+# the request and this check fails with "Forbidden".
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # to post a summary comment
+
+jobs:
+  review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

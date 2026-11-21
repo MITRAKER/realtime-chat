@@ -5,8 +5,8 @@ package postgrestest
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,41 +17,42 @@ import (
 // NewPool returns a pool whose tables live in a fresh schema that is
 // dropped when the test ends. It skips the test when TEST_DATABASE_URL is
 // not set, so `go test ./...` still works without a database.
-func NewPool(t testing.TB) *pgxpool.Pool {
-	t.Helper()
+func NewPool(tb testing.TB) *pgxpool.Pool {
+	tb.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("set TEST_DATABASE_URL to run database tests")
+		tb.Skip("set TEST_DATABASE_URL to run database tests")
 	}
 	ctx := context.Background()
-
-	suffix := make([]byte, 6)
-	rand.Read(suffix)
-	schema := "test_" + hex.EncodeToString(suffix)
+	schema := "test_" + strings.ToLower(rand.Text()[:12])
 
 	admin, err := postgres.Open(ctx, url)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		tb.Fatalf("connect: %v", err)
 	}
-	t.Cleanup(admin.Close)
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
-		t.Fatalf("create schema: %v", err)
+	tb.Cleanup(admin.Close)
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		tb.Fatalf("create schema: %v", err)
 	}
-	t.Cleanup(func() { admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
+	tb.Cleanup(func() {
+		if _, dropErr := admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); dropErr != nil {
+			tb.Errorf("drop test schema %s: %v", schema, dropErr)
+		}
+	})
 
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	// Every connection in this pool looks in our schema first.
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(pool.Close)
-	if err := postgres.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
+	tb.Cleanup(pool.Close)
+	if err = postgres.Migrate(ctx, pool); err != nil {
+		tb.Fatalf("migrate: %v", err)
 	}
 	return pool
 }

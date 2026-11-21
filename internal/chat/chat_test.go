@@ -2,8 +2,10 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -64,11 +66,12 @@ func (e *testEnv) rawDial(t *testing.T) *websocket.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	//nolint:bodyclose // coder/websocket: "You never need to close resp.Body yourself."
 	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http"), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { conn.CloseNow() })
+	t.Cleanup(func() { _ = conn.CloseNow() })
 	return conn
 }
 
@@ -100,6 +103,8 @@ func readUntil(t *testing.T, c *websocket.Conn, match func(Outbound) bool) Outbo
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// jpl:loop returns when a frame matches; a read error (including the
+	// 5 s timeout) fails the test.
 	for {
 		var out Outbound
 		if err := wsjson.Read(ctx, c, &out); err != nil {
@@ -111,11 +116,13 @@ func readUntil(t *testing.T, c *websocket.Conn, match func(Outbound) bool) Outbo
 	}
 }
 
-// closeCode waits for the server to close the connection and returns the code.
-func closeCode(t *testing.T, c *websocket.Conn, wait time.Duration) websocket.StatusCode {
+// closeCode waits up to 5 s for the server to close the connection and
+// returns the close code (-1 if it never sent one).
+func closeCode(t *testing.T, c *websocket.Conn) websocket.StatusCode {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// jpl:loop returns on the first read error: the close, or the timeout.
 	for {
 		if _, _, err := c.Read(ctx); err != nil {
 			return websocket.CloseStatus(err)
@@ -137,7 +144,9 @@ func TestMemoryStoreKeepsOnlyRecentMessages(t *testing.T) {
 	s := NewMemoryStore(3)
 	alice := auth.User{ID: 1, Username: "alice"}
 	for i := 1; i <= 5; i++ {
-		s.SaveMessage(context.Background(), "r", alice, fmt.Sprint(i))
+		if _, err := s.SaveMessage(context.Background(), "r", alice, fmt.Sprint(i)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	msgs, more, _ := s.History(context.Background(), "r", 0, 10)
 	if len(msgs) != 3 || msgs[0].Text != "3" || more {
@@ -253,6 +262,11 @@ func TestBadFramesGetErrors(t *testing.T) {
 		{Inbound{Type: TypeJoin, Room: "two\nlines"}, "room name"},
 		{Inbound{Type: TypeJoin, Room: "red\x1b[31m"}, "room name"}, // a terminal colour code
 		{Inbound{Type: TypeJoin, Room: "nul\x00"}, "room name"},
+		{Inbound{Type: TypeJoin, Room: "gen\u200beral"}, "room name"}, // a zero-width space
+		{Inbound{Type: TypeJoin, Room: "\u202elareneg"}, "room name"}, // shows as "general"
+		{Inbound{Type: TypeJoin, Room: "general\u3164"}, "room name"}, // ends with an invisible letter
+		{Inbound{Type: TypeJoin, Room: "g\u0435neral"}, "room name"},  // a Cyrillic letter that looks like "e"
+		{Inbound{Type: TypeJoin, Room: "game night"}, "room name"},
 	}
 	for _, c := range cases {
 		write(t, alice, c.in)
@@ -288,7 +302,7 @@ func TestInvalidJSONClosesTheConnection(t *testing.T) {
 			if err := conn.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
 				t.Fatal(err)
 			}
-			if code := closeCode(t, conn, 5*time.Second); code != websocket.StatusInvalidFramePayloadData {
+			if code := closeCode(t, conn); code != websocket.StatusInvalidFramePayloadData {
 				t.Fatalf("close code = %v, want %v", code, websocket.StatusInvalidFramePayloadData)
 			}
 		})
@@ -358,7 +372,9 @@ func TestDisconnectTellsOthers(t *testing.T) {
 	alice, bob := e.dial(t, "alice"), e.dial(t, "bob")
 	join(t, alice, "general")
 	join(t, bob, "general")
-	bob.Close(websocket.StatusNormalClosure, "bye")
+	if err := bob.Close(websocket.StatusNormalClosure, "bye"); err != nil {
+		t.Fatal(err)
+	}
 	readUntil(t, alice, func(o Outbound) bool {
 		return o.Type == TypeSystem && o.User == "bob" && strings.Contains(o.Text, "left")
 	})
@@ -392,7 +408,7 @@ func TestAuthIsRequired(t *testing.T) {
 			if first != nil {
 				write(t, conn, *first)
 			}
-			if code := closeCode(t, conn, 5*time.Second); code != StatusUnauthorized {
+			if code := closeCode(t, conn); code != StatusUnauthorized {
 				t.Fatalf("close code = %v, want %v", code, StatusUnauthorized)
 			}
 		})
@@ -407,7 +423,7 @@ func TestConnectionClosesWhenTokenExpires(t *testing.T) {
 	}
 	tok, _, _ := short.Issue(auth.User{ID: 7, Username: "alice"})
 	conn := e.dialWithToken(t, tok)
-	if code := closeCode(t, conn, 5*time.Second); code != StatusUnauthorized {
+	if code := closeCode(t, conn); code != StatusUnauthorized {
 		t.Fatalf("close code = %v, want %v", code, StatusUnauthorized)
 	}
 }
@@ -424,47 +440,48 @@ func TestManyConcurrentClients(t *testing.T) {
 		join(t, conns[i], "load")
 	}
 
+	// Everyone sends at once, and everyone reads at once. Each goroutine
+	// writes only its own slot of errs, so they need no lock.
+	errs := make([]error, n)
 	var wg sync.WaitGroup
 	for i, c := range conns {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = wsjson.Write(ctx, c, Inbound{Type: TypeSend, Room: "load", Text: fmt.Sprint("from ", i)})
-		}()
-	}
-
-	// Every client should see all n messages, each exactly once.
-	errs := make(chan error, n)
-	for i, c := range conns {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			seen := map[int64]bool{}
-			for len(seen) < n {
-				var out Outbound
-				if err := wsjson.Read(ctx, c, &out); err != nil {
-					errs <- fmt.Errorf("client %d saw %d/%d messages: %w", i, len(seen), n, err)
-					return
-				}
-				if out.Type == TypeMessage {
-					if seen[out.ID] {
-						errs <- fmt.Errorf("client %d got message %d twice", i, out.ID)
-						return
-					}
-					seen[out.ID] = true
-				}
+		})
+		wg.Go(func() {
+			if err := expectEachMessageOnce(c, n); err != nil {
+				errs[i] = fmt.Errorf("client %d: %w", i, err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
 	}
+}
+
+// expectEachMessageOnce reads until it has seen n different chat messages,
+// and fails if any message arrives twice.
+func expectEachMessageOnce(c *websocket.Conn, n int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	seen := map[int64]bool{}
+	for len(seen) < n {
+		var out Outbound
+		if err := wsjson.Read(ctx, c, &out); err != nil {
+			return fmt.Errorf("saw %d/%d messages: %w", len(seen), n, err)
+		}
+		if out.Type != TypeMessage {
+			continue
+		}
+		if seen[out.ID] {
+			return fmt.Errorf("got message %d twice", out.ID)
+		}
+		seen[out.ID] = true
+	}
+	return nil
 }
 
 // TestShutdownSaysGoingAway checks that stopping the server closes chat
@@ -475,8 +492,54 @@ func TestShutdownSaysGoingAway(t *testing.T) {
 	alice := e.dial(t, "alice")
 	join(t, alice, "general")
 	e.stopHub()
-	if code := closeCode(t, alice, 5*time.Second); code != websocket.StatusGoingAway {
+	if code := closeCode(t, alice); code != websocket.StatusGoingAway {
 		t.Fatalf("close code = %v, want %v", code, websocket.StatusGoingAway)
+	}
+}
+
+// TestWaitLetsConnectionsSayGoodbye: after the hub stops, Wait must not
+// return while a connection is still saying goodbye, or the server could
+// exit before browsers learn why they were disconnected. Here the client
+// doesn't read at first, so the server's close handshake can't finish yet
+// and Wait has to keep waiting. Once the client reads, it gets 1001 and
+// answers, and Wait returns.
+func TestWaitLetsConnectionsSayGoodbye(t *testing.T) {
+	e := newTestEnv(t)
+	alice := e.dial(t, "alice")
+	join(t, alice, "general")
+	e.stopHub()
+
+	waited := make(chan error, 1)
+	go func() { waited <- e.handler.hub.Wait(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait returned (%v) while a connection was still closing", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if code := closeCode(t, alice); code != websocket.StatusGoingAway {
+		t.Fatalf("close code = %v, want %v", code, websocket.StatusGoingAway)
+	}
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("Wait returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after the connection closed")
+	}
+}
+
+// TestWaitGivesUpWhenItsContextEnds: Wait is bounded by its context, so a
+// connection that never finishes can't keep the server from exiting.
+func TestWaitGivesUpWhenItsContextEnds(t *testing.T) {
+	h := NewHub()
+	done := make(chan struct{})
+	go h.Run(done)
+	t.Cleanup(func() { close(done) })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := h.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait on a running hub returned %v, want %v", err, context.DeadlineExceeded)
 	}
 }
 
@@ -531,6 +594,81 @@ func TestSlowClientIsDropped(t *testing.T) {
 	if got, want := drain(fast), "system:fast joined,system:slow left,message:hi"; got != want {
 		t.Fatalf("fast got %v, want %v", got, want)
 	}
+}
+
+// TestSlowClientsAreDroppedInACascade: removing a client announces "left"
+// in each of its rooms, clients too slow to take that announcement are
+// removed too, their own "left" announcements can find more slow clients,
+// and so on (see removeClient). Here two slow clients share two rooms with
+// a client that leaves. Everyone except the fast client must end up
+// removed, each exactly once (closing a channel twice would panic), and
+// the fast client must hear every departure once in each room.
+func TestSlowClientsAreDroppedInACascade(t *testing.T) {
+	h := NewHub()
+	leaver, slow1, slow2, fast := newTestClient("leaver", 10), newTestClient("slow1", 10),
+		newTestClient("slow2", 10), newTestClient("fast", 10)
+	for _, c := range []*Client{leaver, slow1, slow2, fast} {
+		h.apply(command{kind: cmdRegister, client: c})
+		h.apply(command{kind: cmdJoin, client: c, room: "a"})
+		h.apply(command{kind: cmdJoin, client: c, room: "b"})
+	}
+	drain(fast)
+	fill(slow1)
+	fill(slow2)
+
+	h.apply(command{kind: cmdUnregister, client: leaver})
+
+	if len(h.clients) != 1 || len(h.rooms["a"]) != 1 || len(h.rooms["b"]) != 1 {
+		t.Fatalf("%d clients are still connected, %d and %d in the rooms; want only fast",
+			len(h.clients), len(h.rooms["a"]), len(h.rooms["b"]))
+	}
+	checkRemoved(t, leaver, byeNormal)
+	checkRemoved(t, slow1, byeSlow)
+	checkRemoved(t, slow2, byeSlow)
+	heard := strings.Split(drainWithRooms(fast), ",")
+	slices.Sort(heard) // who goes first depends on map order
+	want := []string{
+		"a: leaver left", "a: slow1 left", "a: slow2 left",
+		"b: leaver left", "b: slow1 left", "b: slow2 left",
+	}
+	if !slices.Equal(heard, want) {
+		t.Fatalf("fast heard %q, want %q", heard, want)
+	}
+}
+
+// fill fills c's buffer, so one more message is too many.
+func fill(c *Client) {
+	for len(c.send) < cap(c.send) {
+		c.send <- Outbound{}
+	}
+}
+
+// checkRemoved checks that the hub closed c's channel, after the messages
+// already in it, and recorded why.
+func checkRemoved(t *testing.T, c *Client, why closeReason) {
+	t.Helper()
+	drain(c)
+	select {
+	case _, open := <-c.send:
+		if open {
+			t.Errorf("%s got a message after being removed", c.user.Username)
+		}
+	default:
+		t.Errorf("%s's channel is still open", c.user.Username)
+	}
+	if c.goodbye != why {
+		t.Errorf("%s's goodbye = %+v, want %+v", c.user.Username, c.goodbye, why)
+	}
+}
+
+// drainWithRooms is drain, with each message's room in front of its text.
+func drainWithRooms(c *Client) string {
+	var got []string
+	for len(c.send) > 0 {
+		m := <-c.send
+		got = append(got, m.Room+": "+m.Text)
+	}
+	return strings.Join(got, ",")
 }
 
 // TestSavedMessageIsDeliveredAfterSenderLeaves: once a message is saved

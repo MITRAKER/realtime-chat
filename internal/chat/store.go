@@ -1,8 +1,10 @@
 package chat
 
 import (
+	"cmp"
 	"context"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,10 +33,14 @@ type MemoryStore struct {
 	now    func() time.Time
 }
 
+// NewMemoryStore returns an empty store that keeps the newest keepPerRoom
+// messages of each room and forgets older ones.
 func NewMemoryStore(keepPerRoom int) *MemoryStore {
 	return &MemoryStore{keep: keepPerRoom, rooms: make(map[string][]Outbound), now: time.Now}
 }
 
+// SaveMessage stores a message, dropping the room's oldest one if the room
+// is full.
 func (s *MemoryStore) SaveMessage(_ context.Context, room string, from auth.User, text string) (Outbound, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,14 +49,14 @@ func (s *MemoryStore) SaveMessage(_ context.Context, room string, from auth.User
 		Type: TypeMessage, Room: room, ID: s.nextID,
 		UserID: from.ID, User: from.Username, Text: text, Time: s.now().UTC(),
 	}
-	msgs := append(s.rooms[room], m)
-	if len(msgs) > s.keep {
-		msgs = msgs[len(msgs)-s.keep:]
+	s.rooms[room] = append(s.rooms[room], m)
+	if extra := len(s.rooms[room]) - s.keep; extra > 0 {
+		s.rooms[room] = s.rooms[room][extra:]
 	}
-	s.rooms[room] = msgs
 	return m, nil
 }
 
+// History returns up to limit messages older than before, oldest first.
 func (s *MemoryStore) History(_ context.Context, room string, before int64, limit int) ([]Outbound, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -58,12 +64,12 @@ func (s *MemoryStore) History(_ context.Context, room string, before int64, limi
 		before = math.MaxInt64
 	}
 	msgs := s.rooms[room]
-	end := len(msgs) // first index with id >= before
-	for end > 0 && msgs[end-1].ID >= before {
-		end--
-	}
-	start := max(end-limit, 0)
-	out := make([]Outbound, end-start)
-	copy(out, msgs[start:end])
-	return out, start > 0, nil
+	// The slice is sorted by id, so binary search finds the first message
+	// with id >= before in log(n) steps.
+	end, _ := slices.BinarySearchFunc(msgs, before, func(m Outbound, id int64) int {
+		return cmp.Compare(m.ID, id)
+	})
+	start := max(end-max(limit, 0), 0)
+	// Copy, so the caller can't change our stored messages.
+	return slices.Clone(msgs[start:end]), start > 0, nil
 }

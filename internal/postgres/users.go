@@ -18,8 +18,11 @@ const uniqueViolation = "23505"
 // UserStore implements auth.UserStore.
 type UserStore struct{ pool *pgxpool.Pool }
 
+// NewUserStore returns a user store that uses pool.
 func NewUserStore(pool *pgxpool.Pool) *UserStore { return &UserStore{pool: pool} }
 
+// CreateUser inserts an account. It returns auth.ErrUsernameTaken if the
+// name is already used in any mix of upper and lower case.
 func (s *UserStore) CreateUser(ctx context.Context, username, passwordHash string) (auth.User, error) {
 	var u auth.User
 	// The values travel separately from the SQL text ($1, $2), so a
@@ -41,6 +44,8 @@ func (s *UserStore) CreateUser(ctx context.Context, username, passwordHash strin
 	return u, err
 }
 
+// UserByUsername finds an account by name, ignoring case, and returns it
+// with its password hash. It returns auth.ErrNotFound if there is none.
 func (s *UserStore) UserByUsername(ctx context.Context, username string) (auth.User, string, error) {
 	var u auth.User
 	var hash string

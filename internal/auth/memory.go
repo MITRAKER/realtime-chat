@@ -21,10 +21,13 @@ type memoryUser struct {
 	hash string
 }
 
+// NewMemoryUserStore returns an empty store.
 func NewMemoryUserStore() *MemoryUserStore {
 	return &MemoryUserStore{byName: make(map[string]memoryUser)}
 }
 
+// CreateUser adds an account, or returns ErrUsernameTaken if the name is
+// already used in any mix of upper and lower case.
 func (s *MemoryUserStore) CreateUser(_ context.Context, username, passwordHash string) (User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -38,6 +41,8 @@ func (s *MemoryUserStore) CreateUser(_ context.Context, username, passwordHash s
 	return u, nil
 }
 
+// UserByUsername finds an account by name, ignoring case, and returns it
+// with its password hash. It returns ErrNotFound if there is none.
 func (s *MemoryUserStore) UserByUsername(_ context.Context, username string) (User, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

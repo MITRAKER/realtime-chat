@@ -4,10 +4,56 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Every day at 06:17 UTC: static analysis, the vulnerability scan and
+    # fuzzing run even when nobody pushes, because new vulnerabilities are
+    # published all the time (JPL rule 10: analyze every day).
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# Least privilege: jobs can read the code and nothing else unless they ask.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels that pull request's older, now
+# pointless run. Every other run (a push to main, the daily schedule, a
+# manual run) gets a group of its own and is never cancelled, so every
+# merged commit gets a full result and the daily fuzzing always finishes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
+    name: Lint and static analysis
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint (formatting, bugs, style, security, complexity)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+      - name: NASA/JPL rules 1 and 2 (no recursion, no goto, documented loops)
+        run: go run ./cmd/jplcheck ./...
+      - name: ShellCheck (shell scripts)
+        run: shellcheck scripts/*.sh
+
+  test:
+    name: Test on Go ${{ matrix.go }} (race detector, PostgreSQL, coverage)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two Go releases the Go team still supports.
+        go: [oldstable, stable]
     services:
       # A throwaway PostgreSQL just for this job, so database tests run too.
       postgres:
@@ -26,13 +72,100 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://chat:chat@localhost:5432/chat_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Vet
-        run: go vet ./...
-      - name: Test (with race detector and PostgreSQL)
-        run: go test -race -count=1 ./...
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: Test with coverage (fails below 80%)
+        run: ./scripts/coverage.sh coverage.out
+      - uses: actions/upload-artifact@v7
+        if: always() && matrix.go == 'stable'
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  vulncheck:
+    name: Known vulnerabilities (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      # Reports only vulnerabilities in code this program can actually
+      # reach, in its dependencies and in Go's standard library.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  build:
+    name: Build binaries and Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      # The release workflow only runs when a version tag is pushed. So that a
+      # broken release shows up here instead, on every change, rehearse it:
+      # build and pack the binaries for every platform, without publishing,
+      # with the same GoReleaser version as release.yml. (A rehearsal skips
+      # the release notes; only a real release writes them.)
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.20.3 # upgrade by hand, here and in release.yml together
+          install-only: true
+      - name: Release configuration has no unknown or outdated settings
+        run: goreleaser check
+      - name: Release builds for every platform (rehearsal, not published)
+        run: goreleaser release --snapshot --clean
+      - uses: docker/setup-buildx-action@v4
+      - name: Docker image builds
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  fuzz:
+    name: Fuzz tests (daily)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Fuzz each target for one minute
+        run: ./scripts/fuzz.sh 60s
+      # If the fuzzer finds a crash, it saves the input under testdata/fuzz.
+      # Keep it so the bug can be reproduced and added as a regression test.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+
+  # One check to require in branch protection: it passes only when every
+  # job above passed (the fuzz job is skipped on pull requests, which is fine).
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [lint, test, vulncheck, build, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then exit 1; fi
+          done

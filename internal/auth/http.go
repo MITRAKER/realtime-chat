@@ -117,7 +117,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store") // never cache tokens
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// The status line has already gone out, so all we can do is note
+		// it. This almost always means the browser hung up.
+		slog.Debug("write JSON response", "err", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

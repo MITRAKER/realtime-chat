@@ -63,6 +63,13 @@ func NewHandler(hub *Hub, store Store, tokens *auth.Tokens) *Handler {
 // If no valid token arrives within 5 seconds, the server closes the
 // connection with code 4401.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Count this connection until it has completely finished, so that
+	// Hub.Wait can wait for its goodbye at shutdown. Counting starts before
+	// the upgrade: after it, the HTTP server no longer tracks the
+	// connection, and srv.Shutdown won't wait for it.
+	h.hub.conns.Add(1)
+	defer h.hub.conns.Done()
+
 	// Accept performs the HTTP -> WebSocket "upgrade" handshake.
 	// By default it rejects cross-origin requests, which protects
 	// against other websites opening sockets as your users.
@@ -71,12 +78,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("upgrade failed", "err", err)
 		return
 	}
-	defer conn.CloseNow()
+	// Whatever happens below, release the socket at the end. Closing an
+	// already-closed connection returns an error we have no use for.
+	defer func() { _ = conn.CloseNow() }()
 	conn.SetReadLimit(maxFrameSize)
 
 	claims, err := h.authenticate(r.Context(), conn)
 	if err != nil {
-		conn.Close(StatusUnauthorized, "unauthorized")
+		_ = conn.Close(StatusUnauthorized, "unauthorized")
 		return
 	}
 	user := claims.User()
@@ -84,7 +93,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A token only proves who you are until it expires, so close the
 	// connection at that moment too. The browser then logs in again.
 	expiry := time.AfterFunc(time.Until(claims.ExpiresAt), func() {
-		conn.Close(StatusUnauthorized, "token expired")
+		_ = conn.Close(StatusUnauthorized, "token expired")
 	})
 	defer expiry.Stop()
 
@@ -104,7 +113,7 @@ func (h *Handler) authenticate(ctx context.Context, conn *websocket.Conn) (auth.
 	// (A context deadline on the read would also stop it, but the library
 	// then drops the connection without saying why.)
 	timer := time.AfterFunc(h.authTimeout, func() {
-		conn.Close(StatusUnauthorized, "no login token received")
+		_ = conn.Close(StatusUnauthorized, "no login token received")
 	})
 	defer timer.Stop()
 

@@ -1,0 +1,59 @@
+# Checks that run on every `git commit`, before the commit is created, so
+# problems are caught in seconds instead of minutes later in CI.
+#
+# Install once:  pip install pre-commit && make hooks
+# Run by hand:   pre-commit run --all-files
+# Update hooks:  pre-commit autoupdate
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Blocks commits that contain secrets (API keys, tokens, passwords).
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # Finds bugs in the shell scripts under scripts/ (quoting, unset variables).
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  # Go checks use the tools installed on your machine (see CONTRIBUTING.md).
+  - repo: local
+    hooks:
+      - id: go-mod-tidy
+        name: go mod tidy
+        entry: go mod tidy -diff
+        language: system
+        pass_filenames: false
+        files: (\.go|go\.mod|go\.sum)$
+      - id: golangci-lint
+        name: golangci-lint (changed code)
+        entry: golangci-lint run --new-from-rev HEAD
+        language: system
+        pass_filenames: false
+        types: [go]
+      - id: jplcheck
+        name: NASA/JPL rules
+        entry: go run ./cmd/jplcheck ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+      - id: go-test
+        name: go test (before push)
+        entry: go test -race ./...
+        language: system
+        pass_filenames: false
+        types: [go]
+        stages: [pre-push]

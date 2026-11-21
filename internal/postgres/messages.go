@@ -14,8 +14,10 @@ import (
 // MessageStore implements chat.Store.
 type MessageStore struct{ pool *pgxpool.Pool }
 
+// NewMessageStore returns a message store that uses pool.
 func NewMessageStore(pool *pgxpool.Pool) *MessageStore { return &MessageStore{pool: pool} }
 
+// SaveMessage inserts a message. The database assigns its id and time.
 func (s *MessageStore) SaveMessage(ctx context.Context, room string, from auth.User, text string) (chat.Outbound, error) {
 	m := chat.Outbound{Type: chat.TypeMessage, Room: room, UserID: from.ID, User: from.Username, Text: text}
 	err := s.pool.QueryRow(ctx,
