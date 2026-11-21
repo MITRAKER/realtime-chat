@@ -21,8 +21,9 @@ the history, with no release notes, binaries or image.
 - CI on every push and pull request: `go mod tidy` check, `go vet`,
   golangci-lint with about 50 linters, the NASA/JPL rule checker, ShellCheck,
   tests with the race detector and a real PostgreSQL on the two supported Go
-  releases, a coverage minimum of 80%, `govulncheck`, builds for five
-  platforms and the Docker image, and a check of the release configuration.
+  releases, a coverage minimum of 80%, `govulncheck`, a rehearsal of the
+  release (GoReleaser builds and packs the binaries for five platforms without
+  publishing them), and a build of the Docker image.
   One "CI OK" check sums it all up for branch protection.
 - A daily scheduled run of static analysis, the vulnerability scan and the
   fuzz tests, so new problems are found even when nobody pushes.

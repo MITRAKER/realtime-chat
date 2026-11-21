@@ -76,7 +76,7 @@ Add `!` after the type for a breaking change (`feat!: ...`).
 | Known vulnerabilities | `govulncheck` | the code calls a vulnerable function |
 | Security bugs | CodeQL | the change adds an alert of severity "error", or a security alert rated high or critical |
 | Risky dependency changes | Dependency review | a PR adds a dependency with a known vulnerability of moderate severity or worse |
-| Builds | `go build`, `goreleaser check`, Docker | a release platform or the image fails to build, or the release configuration is invalid |
+| Builds | GoReleaser (`check`, then a release rehearsal that publishes nothing), Docker | the release configuration has an unknown or outdated setting, or a release platform or the image fails to build |
 | Fuzz tests (daily) | `scripts/fuzz.sh` | a fuzz test finds an input that breaks its property |
 
 **CI OK** passes only when every job of the CI workflow passed, so it is the

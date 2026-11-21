@@ -835,7 +835,7 @@ someone published or `run:`s a command. `needs:` makes one job wait for others.
 | Lint and static analysis | `go.mod` is tidy, `go vet` and about 50 linters find nothing, the JPL rules hold, the shell scripts are clean |
 | Test (twice) | every test passes with the race detector against a real PostgreSQL, on both supported Go versions, with at least 80% coverage |
 | Known vulnerabilities | no vulnerable function in our dependencies or the standard library is reachable from our code |
-| Build | the server compiles for Linux, macOS and Windows, the release configuration is valid, and the Docker image builds |
+| Build | a rehearsal of the release (GoReleaser builds and packs the binaries for Linux, macOS and Windows, but publishes nothing) succeeds, and the Docker image builds |
 | Fuzz tests | (daily only) a minute of fuzzing per target finds nothing |
 | CI OK | every job above passed |
 
@@ -854,16 +854,19 @@ A few details are worth copying into every project:
   release with new checks can't turn the build red overnight. Upgrading is a
   deliberate change made by hand: the version is written in `ci.yml` and in
   the `Makefile`, and both change together (the same goes for `govulncheck`).
-  Dependabot can't do it for you: it updates `go.mod` and the `uses:` lines of
-  workflows, not a version given to an action as an input. The strictest teams
-  pin actions to a full commit hash instead of a tag like `v6`, since a tag
-  can be moved.
+  GoReleaser is pinned the same way, in `ci.yml` and `release.yml`, so the
+  version that rehearses the release on every change is the one that builds
+  the real release. Dependabot can't do it for you: it updates `go.mod` and
+  the `uses:` lines of workflows, not a version given to an action as an
+  input. The strictest teams pin actions to a full commit hash instead of a
+  tag like `v6`, since a tag can be moved.
 - **No caches in releases.** CI caches downloaded modules and compiled packages
   between runs to save time. A run for a version tag can restore a cache that
   a run on `main` saved, and runs on `main` execute third-party tools. If one
   of those tools were compromised, it could plant compiled code in the cache,
-  and the next release would ship it. So the release workflow builds from
-  scratch (`cache: false`): slower, but it contains only what the tagged
+  and the next release would ship it. So the release workflow uses no caches
+  (`cache: false` for Go, `cache-image: false` for the QEMU emulator that
+  builds the ARM image): slower, but a release contains only what the tagged
   commit says.
 - **One summary check.** Branch protection asks you to name the checks that
   must pass. Naming every job means editing the settings whenever a job is
@@ -976,8 +979,8 @@ client was added again by every announcement it missed while it waited its
 turn: with n slow clients sharing r rooms, about r × n² / 2 entries. The loop
 still ended, because removed clients are skipped, but memory wasn't bounded
 (rule 3). Measured with 500 slow clients in 100 shared rooms, one removal made
-the heap grow by up to 1.3 GB and took 3 to 7 seconds; with `queued`, the heap
-grows by 5 MB and it takes 0.7 seconds.
+the heap grow by more than 1 GB and took 3 to 7 seconds; with `queued`, the
+heap grows by less than 10 MB and it takes about 0.7 seconds.
 Those 0.7 seconds are still the hub doing nothing else, because each departure
 is announced to everyone left in every room. Limits on connections per user
 (step 5) are what stop someone from setting that up.
@@ -1298,9 +1301,11 @@ modules in `go.mod`. A professional repository watches that code too.
   (which workflow built it, from which commit). When the next big
   vulnerability in a popular library is announced, an SBOM answers "are we
   affected?" in seconds. Both are attached to the image unsigned: they record
-  how it was made, but can't prove who wrote them. Signing them, for example
-  with GitHub's artifact attestations (`actions/attest-build-provenance`), is
-  the next step up.
+  how it was made, but can't prove who wrote them. The next step up is
+  GitHub's artifact attestations: the `actions/attest` action writes a
+  provenance statement of its own for the image, from the workflow run, and
+  signs it (it can sign an SBOM file you made, too). Anyone can then check it
+  with `gh attestation verify`.
 
 ### 3.8 Containers and releases
 
@@ -1340,9 +1345,10 @@ the server logs at startup.
 PATCH, a new feature bumps MINOR, a breaking change bumps MAJOR. Before 1.0.0,
 anything may still change. Pushing a tag like `v0.3.0` starts the release
 workflow: it runs the tests again, **GoReleaser** cross-compiles the binaries,
-packs them with checksums and writes release notes, and **Docker Buildx**
-builds the image for both Intel and ARM servers and pushes it to the GitHub
-Container Registry.
+packs them with checksums, writes release notes and publishes the GitHub
+release, and then **Docker Buildx** builds the image for both Intel and ARM
+servers and pushes it to the GitHub Container Registry. The image waits for
+the release, so a release that fails never publishes an image.
 
 The release notes write themselves because commit messages follow
 **Conventional Commits** (`feat: ...`, `fix: ...`, `docs: ...`): a program can
@@ -1407,7 +1413,8 @@ Under General, turn on "automatically delete head branches".
 6. Build and look inside the image: `docker build -t realtime-chat .`, then
    `docker images realtime-chat` for its size, and try
    `docker run --rm -it --entrypoint sh realtime-chat`. Why does that fail?
-7. Do a release dry run: `goreleaser release --snapshot --clean`, then look in
+7. Do a release dry run, as CI does on every change:
+   `goreleaser release --snapshot --clean`. Then look in
    `dist/`. Run the binary for your machine and read the version it logs.
 8. **Think about it:** CI requires 80% coverage. Write a test that raises
    coverage without being able to catch any bug. What does that tell you about
@@ -1415,9 +1422,9 @@ Under General, turn on "automatically delete head branches".
 9. Remove `queued` from `removeClient` (keep the `append`) and run
    `go test ./internal/chat`. Do the tests notice? Write a benchmark with 300
    slow clients that share 50 rooms, run it with `go test -bench . -benchmem`
-   with and without `queued`, and compare. (`-benchmem` counts everything
-   allocated during a run, not the most in use at once, so expect bigger
-   numbers than the heap growth in section 3.3.)
+   with and without `queued`, and compare the two runs. (`-benchmem` counts
+   every byte allocated during a run, not the most in use at once, so its
+   numbers can't be compared with the heap growth in section 3.3.)
 10. **Exercise:** allow Unicode room names safely. Normalize names to NFC
     (`golang.org/x/text/unicode/norm`), refuse names that mix scripts, and
     refuse a new room whose UTS #39 skeleton matches an existing room's. Which

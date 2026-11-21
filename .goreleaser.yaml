@@ -1,5 +1,6 @@
 # GoReleaser builds and publishes a release when a version tag is pushed.
-# Try it locally without publishing: goreleaser release --snapshot --clean
+# CI rehearses it without publishing on every change. To do the same locally:
+# goreleaser release --snapshot --clean
 version: 2
 
 project_name: realtime-chat

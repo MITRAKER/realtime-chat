@@ -109,20 +109,21 @@ jobs:
         with:
           go-version: stable
           check-latest: true
-      - name: Cross-compile for every release platform
-        run: |
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
-            echo "building $target"
-            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/server
-          done
-      # The release workflow only runs when a version tag is pushed, so check
-      # its GoReleaser configuration here, on every change.
-      - name: Release configuration is valid
+      # The release workflow only runs when a version tag is pushed. So that a
+      # broken release shows up here instead, on every change, rehearse it:
+      # build and pack the binaries for every platform, without publishing,
+      # with the same GoReleaser version as release.yml. (A rehearsal skips
+      # the release notes; only a real release writes them.)
+      - name: Install GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: "~> v2"
-          args: check
+          version: v2.20.3 # upgrade by hand, here and in release.yml together
+          install-only: true
+      - name: Release configuration has no unknown or outdated settings
+        run: goreleaser check
+      - name: Release builds for every platform (rehearsal, not published)
+        run: goreleaser release --snapshot --clean
       - uses: docker/setup-buildx-action@v4
       - name: Docker image builds
         uses: docker/build-push-action@v7

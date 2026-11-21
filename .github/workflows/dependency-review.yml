@@ -4,8 +4,8 @@ name: Dependency review
 # a known vulnerability of moderate severity or worse, and fail if so.
 #
 # It reads the repository's dependency graph, which the owner must switch on
-# (Settings, Advanced Security, Dependency graph). Until then this check fails
-# with "Dependency review is not supported on this repository".
+# (Settings, Advanced Security, Dependency graph). Until then GitHub refuses
+# the request and this check fails with "Forbidden".
 on:
   pull_request:
 
