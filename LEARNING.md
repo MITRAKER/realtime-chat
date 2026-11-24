@@ -820,8 +820,8 @@ jobs:
       postgres:                  # a real database next to the job
         image: postgres:17
     steps:
-      - uses: actions/checkout@v6      # a ready-made action
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7      # a ready-made action
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
       - run: ./scripts/coverage.sh coverage.out   # a shell command
@@ -829,6 +829,9 @@ jobs:
 
 Jobs run in parallel, each on its own machine. A step either `uses:` an action
 someone published or `run:`s a command. `needs:` makes one job wait for others.
+The `@v7` after an action's name is the major version to use. When a new one
+comes out, Dependabot opens a pull request that updates the real workflows, so
+there it may be newer than in this example.
 
 | Job | What passing proves |
 |---|---|
